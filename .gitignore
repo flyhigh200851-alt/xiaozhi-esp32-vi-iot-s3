@@ -18,3 +18,5 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+esp-idf-v5.5.4/
+__pycache__/

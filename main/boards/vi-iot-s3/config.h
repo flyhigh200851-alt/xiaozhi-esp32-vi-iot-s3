@@ -1,0 +1,41 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+#include "audio_codec.h"
+
+#define AUDIO_INPUT_SAMPLE_RATE   16000
+#define AUDIO_OUTPUT_SAMPLE_RATE  16000
+
+/* I2S 引脚 - 连接 ES8311 audio codec */
+#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_5
+#define AUDIO_I2S_GPIO_WS   GPIO_NUM_9
+#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_46
+#define AUDIO_I2S_GPIO_DIN  GPIO_NUM_15
+#define AUDIO_I2S_GPIO_DOUT GPIO_NUM_8
+
+/* I2C 总线 - XL9555 和 ES8311 共用 */
+#define AUDIO_CODEC_I2C_SDA_PIN  GPIO_NUM_10
+#define AUDIO_CODEC_I2C_SCL_PIN  GPIO_NUM_11
+
+#define AUDIO_CODEC_ES8311_ADDR  ES8311_CODEC_DEFAULT_ADDR
+#define AUDIO_CODEC_ES7210_ADDR  0x82
+
+/* 板载资源 */
+#define BUILTIN_LED_GPIO        GPIO_NUM_4
+#define BOOT_BUTTON_GPIO        GPIO_NUM_0
+
+/* ST7789 屏幕参数 */
+#define DISPLAY_WIDTH   320
+#define DISPLAY_HEIGHT  240
+#define DISPLAY_MIRROR_X false
+#define DISPLAY_MIRROR_Y true
+#define DISPLAY_SWAP_XY true
+
+#define DISPLAY_OFFSET_X  0
+#define DISPLAY_OFFSET_Y  0
+
+#define DISPLAY_BACKLIGHT_PIN GPIO_NUM_NC  /* 背光通过 XL9555 控制 */
+#define DISPLAY_BACKLIGHT_OUTPUT_INVERT false
+
+#endif // _BOARD_CONFIG_H_
