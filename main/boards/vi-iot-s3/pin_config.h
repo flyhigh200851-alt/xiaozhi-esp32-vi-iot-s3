@@ -41,6 +41,10 @@
 
 /* ============ 按键 ============ */
 #define BOOT_BUTTON_GPIO            GPIO_NUM_0
+#define XL9555_BTN_1                IO0_1
+#define XL9555_BTN_2                IO0_2
+#define XL9555_BTN_3                IO0_3
+#define XL9555_BTN_4                IO0_4
 
 #define XL9555_PA_PIN               IO0_0
 

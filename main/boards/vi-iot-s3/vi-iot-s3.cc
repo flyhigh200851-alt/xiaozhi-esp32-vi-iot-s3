@@ -20,6 +20,8 @@ void xl9555_init_with_bus(i2c_master_bus_handle_t bus);
 }
 
 #include "codecs/no_audio_codec.h"
+#include "settings.h"
+#include <esp_system.h>
 
 #define TAG "VI-IOT-S3"
 
@@ -83,6 +85,38 @@ private:
         xl9555_pin_write(XL9555_PA_PIN, 1);
     }
 
+    static void PollButtonsTask(void* arg) {
+        uint16_t* pins = (uint16_t*)arg;
+        const char* urls[4] = {"", "http://192.168.31.92:8003/xiaozhi/ota/", "http://192.168.31.92:8004/xiaozhi/ota/", ""};
+        const char* names[4] = {"云小智", "Dify", "Ollama", "预留4"};
+        bool prev[4] = {true, true, true, true};
+        while (true) {
+            for (int i = 0; i < 4; i++) {
+                bool curr = xl9555_pin_read(pins[i]) != 0;
+                if (prev[i] && !curr) {
+                    vTaskDelay(pdMS_TO_TICKS(30));
+                    curr = xl9555_pin_read(pins[i]) != 0;
+                    if (!curr) {
+                        ESP_LOGI(TAG, "Mode switch -> %s", names[i]);
+                        while (xl9555_pin_read(pins[i]) == 0) vTaskDelay(pdMS_TO_TICKS(10));
+                        Settings s("wifi", true);
+                        s.SetString("ota_url", urls[i]);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        esp_restart();
+                    }
+                }
+                prev[i] = curr;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
+    void StartButtonPoller() {
+        static uint16_t pins[4] = {XL9555_BTN_1, XL9555_BTN_2, XL9555_BTN_3, XL9555_BTN_4};
+        xTaskCreate(PollButtonsTask, "btn_poll", 4096, pins, 5, NULL);
+        ESP_LOGI(TAG, "Button poller started");
+    }
+
     void InitializeST7789Display() {
         ESP_LOGI(TAG, "Init ST7789 i80 8-bit display");
         esp_lcd_i80_bus_config_t bus_config = {};
@@ -117,7 +151,6 @@ private:
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel_handle));
         esp_lcd_panel_reset(panel_handle);
         esp_lcd_panel_init(panel_handle);
-        esp_lcd_panel_set_gap(panel_handle, 0, 80);
         esp_lcd_panel_invert_color(panel_handle, true);
         esp_lcd_panel_swap_xy(panel_handle, true);
         esp_lcd_panel_mirror(panel_handle, false, true);
@@ -150,6 +183,7 @@ public:
         InitializeXL9555();
         InitializeButtons();
         InitializeST7789Display();
+        StartButtonPoller();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
