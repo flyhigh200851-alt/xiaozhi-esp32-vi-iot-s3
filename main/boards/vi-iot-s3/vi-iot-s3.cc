@@ -31,6 +31,7 @@
 #define MOTOR_RR_DIR2  13  /* CH13 -> BIN2 右后方向 */
 #include "config.h"
 #include "display.h"
+#include "wifi_cmd_server.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -159,9 +160,11 @@ static void motor_all(int fl, int fr, int rl, int rr) {
 }
 
 /* 带屏幕提示的电机控制 */
+struct CarStatus { int speed=0; const char* dir="停止"; const char* mode="语音"; const char* model="云小智"; int dist=-1; bool radar=false; char speech[256]={0}; };
+CarStatus g_cs;
+
 static void motor_notify(const char* status, int fl, int fr, int rl, int rr) {
-    auto display = Board::GetInstance().GetDisplay();
-    if (display) display->ShowNotification(status, 2500);
+    g_cs.dir = status;
     motor_all(fl, fr, rl, rr);
 }
 
@@ -195,6 +198,42 @@ static void RunMotorTestTask(void* param) {
     vTaskDelay(pdMS_TO_TICKS(500));
     motor_test();
     vTaskDelete(NULL);
+}
+
+void web_cmd_callback(const char* cmd, int val) {
+    g_cs.speed = val;
+    if (!strcmp(cmd,"F")){ motor_all(val,val,val,val); g_cs.dir="前进"; }
+    else if (!strcmp(cmd,"B")){ motor_all(-val,-val,-val,-val); g_cs.dir="后退"; }
+    else if (!strcmp(cmd,"L")){ motor_all(0,val,0,val); g_cs.dir="左转"; }
+    else if (!strcmp(cmd,"R")){ motor_all(val,0,val,0); g_cs.dir="右转"; }
+    else if (!strcmp(cmd,"SL")){ motor_all(val,-val,-val,val); g_cs.dir="左横移"; }
+    else if (!strcmp(cmd,"SR")){ motor_all(-val,val,val,-val); g_cs.dir="右横移"; }
+    else if (!strcmp(cmd,"C")){ motor_all(val,-val,val,-val); g_cs.dir="旋转"; }
+    else if (!strcmp(cmd,"CC")){ motor_all(-val,val,-val,val); g_cs.dir="旋转"; }
+    else if (!strcmp(cmd,"S")){ motor_stop(); g_cs.dir="停止"; g_cs.speed=0; }
+    else if (!strcmp(cmd,"T")){ motor_test(); }
+}
+
+static void status_broadcast(void*) {
+    vTaskDelay(pdMS_TO_TICKS(15000)); /* 等网络就绪 */
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int bcast = 1; setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &bcast, sizeof(bcast));
+    struct sockaddr_in d = {}; d.sin_family = AF_INET; d.sin_port = htons(8889);
+    d.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    while (1) {
+        cJSON* j = cJSON_CreateObject();
+        cJSON_AddNumberToObject(j,"speed",g_cs.speed);
+        cJSON_AddStringToObject(j,"dir",g_cs.dir);
+        cJSON_AddNumberToObject(j,"dist",g_cs.dist);
+        cJSON_AddBoolToObject(j,"radar",g_cs.radar);
+        cJSON_AddStringToObject(j,"mode",g_cs.mode);
+        cJSON_AddStringToObject(j,"model",g_cs.model);
+        cJSON_AddStringToObject(j,"speech",g_cs.speech);
+        char* str = cJSON_PrintUnformatted(j);
+        sendto(sock, str, strlen(str), 0, (struct sockaddr*)&d, sizeof(d));
+        free(str); cJSON_Delete(j);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
 }
 
 class ViIotS3Board : public WifiBoard {
@@ -361,19 +400,21 @@ public:
         pca9685_init();
         /* 注册电机 MCP 工具，AI 可通过语音控制小车 */
         new MotorController(
-            [](int s) { motor_notify("前进",  s,  s,  s,  s); },  // 前进
-            [](int s) { motor_notify("后退", -s, -s, -s, -s); },  // 后退
-            [](int s) { motor_notify("左转",  0,  s,  0,  s); },  // 左转
-            [](int s) { motor_notify("右转",  s,  0,  s,  0); },  // 右转
-            [](int s) { motor_notify("左横移", s, -s, -s,  s); },  // 左平移（横移）
-            [](int s) { motor_notify("右横移",-s,  s,  s, -s); },  // 右平移（横移）
-            [](int s) { motor_notify("旋转",  s, -s,  s, -s); },  // 旋转（正数=顺时针, 负数=逆时针）
-            []()      { auto d = Board::GetInstance().GetDisplay(); if(d) d->ShowNotification("已停止", 1500); motor_stop(); },                 // 停止
-            []()      { motor_test(); }                  // 测 试
+            [](int s) { g_cs.speed=s; motor_notify("前进",  s,  s,  s,  s); },
+            [](int s) { g_cs.speed=s; motor_notify("后退", -s, -s, -s, -s); },
+            [](int s) { g_cs.speed=s; motor_notify("左转",  0,  s,  0,  s); },
+            [](int s) { g_cs.speed=s; motor_notify("右转",  s,  0,  s,  0); },
+            [](int s) { g_cs.speed=s; motor_notify("左横移", s, -s, -s,  s); },
+            [](int s) { g_cs.speed=s; motor_notify("右横移",-s,  s,  s, -s); },
+            [](int s) { g_cs.speed=s; motor_notify("旋转",  s, -s,  s, -s); },
+            []()      { g_cs.dir="停止";g_cs.speed=0; motor_stop(); },
+            []()      { motor_test(); }
         );
         InitializeButtons();
         InitializeST7789Display();
         StartButtonPoller();
+        new WifiCmdServer(web_cmd_callback);
+        xTaskCreate(status_broadcast, "stat_udp", 4096, NULL, 5, NULL);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
