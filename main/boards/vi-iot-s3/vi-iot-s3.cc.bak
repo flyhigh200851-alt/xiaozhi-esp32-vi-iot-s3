@@ -12,7 +12,7 @@
 #define PCA9685_PRE_SCALE   0xFE
 #define PCA9685_LED0_ON_L   0x06
 
-#define PCA9685_FREQ        1000  /* Hz */
+#define PCA9685_FREQ        50  /* Hz */
 
 /* 电机引脚映射（PCA9685通道 -> TB6612功能）*/
 /* 前轮 - TB6612 #1 */
@@ -45,7 +45,6 @@ void xl9555_init_with_bus(i2c_master_bus_handle_t bus);
 
 #include "codecs/no_audio_codec.h"
 #include "settings.h"
-#include "motor_controller.h"
 #include <esp_system.h>
 
 #define TAG "VI-IOT-S3"
@@ -55,7 +54,7 @@ void xl9555_init_with_bus(i2c_master_bus_handle_t bus);
 #define PCA9685_MODE1       0x00
 #define PCA9685_PRE_SCALE   0xFE
 #define PCA9685_LED0_ON_L   0x06
-#define PCA9685_FREQ        1000
+#define PCA9685_FREQ        50
 
 /* 电机映射 */
 #define MOTOR_LF_PWM   0
@@ -88,8 +87,8 @@ static i2c_master_bus_handle_t pca9685_bus = NULL;
 static void pca9685_init() {
     i2c_master_bus_config_t bcfg = {};
     bcfg.i2c_port = I2C_NUM_1;
-    bcfg.sda_io_num = GPIO_NUM_19;
-    bcfg.scl_io_num = GPIO_NUM_20;
+    bcfg.sda_io_num = GPIO_NUM_15;
+    bcfg.scl_io_num = GPIO_NUM_16;
     bcfg.clk_source = I2C_CLK_SRC_DEFAULT;
     bcfg.glitch_ignore_cnt = 7;
     bcfg.intr_priority = 0;
@@ -106,11 +105,6 @@ static void pca9685_init() {
     pca9685_write_reg(PCA9685_PRE_SCALE, ps);
     pca9685_write_reg(PCA9685_MODE1, 0xA0);  // 0xA0 = RESTART + AI enable
     vTaskDelay(pdMS_TO_TICKS(10));
-    /* 回读 MODE1 确认 I2C 通信正常 */
-    uint8_t mode1_val = 0;
-    uint8_t reg = 0;
-    i2c_master_transmit_receive(pca9685_dev, &reg, 1, &mode1_val, 1, 100);
-    ESP_LOGI("MOTOR", "MODE1 after init = 0x%02X (expected 0xA0)", mode1_val);
     for (int c=0; c<16; c++) pca9685_set_pwm(c, 0, 0);
     ESP_LOGI("MOTOR", "PCA9685 ready");
 }
@@ -124,61 +118,30 @@ static const int motor_ch[4][3] = {
 };
 
 static __attribute__((unused)) void motor_stop() {
-    for (int m=0; m<4; m++) {
-        pca9685_set_pwm(motor_ch[m][1], 0, 0);
-        pca9685_set_pwm(motor_ch[m][2], 0, 0);
-        pca9685_set_pwm(motor_ch[m][0], 0, 0);
-    }
+    for (int m=0; m<4; m++) pca9685_set_pwm(motor_ch[m][0], 0, 4095);
 }
 static void motor_set(int id, int speed) {
     if(id<0||id>3) return;
     if(speed>100) speed=100;
     if(speed<-100) speed=-100;
-    uint16_t pwm = (uint16_t)(abs(speed)*40.95f);
-    pca9685_set_pwm(motor_ch[id][1], 0, speed>0?0:4095);
-    pca9685_set_pwm(motor_ch[id][2], 0, speed>0?4095:0);
+    uint16_t pwm = speed? (uint16_t)(abs(speed)*40.95f) : 4095;
     pca9685_set_pwm(motor_ch[id][0], 0, pwm);
-    if(speed==0) {
-        pca9685_set_pwm(motor_ch[id][1], 0, 0);
-        pca9685_set_pwm(motor_ch[id][2], 0, 0);
+    if(speed!=0) {
+        pca9685_set_pwm(motor_ch[id][1], 0, speed>0?0:4095);
+        pca9685_set_pwm(motor_ch[id][2], 0, speed>0?4095:0);
     }
 }
 static void motor_all(int fl, int fr, int rl, int rr) {
     motor_set(0,fl); motor_set(1,fr); motor_set(2,rl); motor_set(3,rr);
 }
 
-static void read_mode1() {
-    uint8_t mode1_val = 0;
-    uint8_t reg = 0;
-    esp_err_t err = i2c_master_transmit_receive(pca9685_dev, &reg, 1, &mode1_val, 1, 100);
-    if (err == ESP_OK)
-        ESP_LOGI("MOTOR", "MODE1 = 0x%02X", mode1_val);
-    else
-        ESP_LOGE("MOTOR", "I2C read failed: %d", err);
-}
-
 static void motor_test() {
-    read_mode1();
-    ESP_LOGI("MOTOR", "=== Motor Test Start ===");
-    ESP_LOGI("MOTOR", "Motor 0 (LF) speed=50");
     motor_all(50,0,0,0); vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI("MOTOR", "Motor 1 (RF) speed=50");
     motor_all(0,50,0,0); vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI("MOTOR", "Motor 2 (LR) speed=50");
     motor_all(0,0,50,0); vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI("MOTOR", "Motor 3 (RR) speed=50");
     motor_all(0,0,0,50); vTaskDelay(pdMS_TO_TICKS(2000));
     motor_stop();
-    ESP_LOGI("MOTOR", "=== Motor Test Done ===");
 }
-
-/* 按键触发电机测试（启动后等500ms确保系统稳定）*/
-static void RunMotorTestTask(void* param) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-    motor_test();
-    vTaskDelete(NULL);
-}
-
 class ViIotS3Board : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -251,17 +214,12 @@ private:
                     vTaskDelay(pdMS_TO_TICKS(30));
                     curr = xl9555_pin_read(pins[i]) != 0;
                     if (!curr) {
+                        ESP_LOGI(TAG, "Mode switch -> %s", names[i]);
                         while (xl9555_pin_read(pins[i]) == 0) vTaskDelay(pdMS_TO_TICKS(10));
-                        if (i == 3) {
-                            ESP_LOGI(TAG, "Motor test triggered by button 4");
-                            xTaskCreate(RunMotorTestTask, "mtr_test", 4096, NULL, 5, NULL);
-                        } else {
-                            ESP_LOGI(TAG, "Mode switch -> %s", names[i]);
-                            Settings s("wifi", true);
-                            s.SetString("ota_url", urls[i]);
-                            vTaskDelay(pdMS_TO_TICKS(200));
-                            esp_restart();
-                        }
+                        Settings s("wifi", true);
+                        s.SetString("ota_url", urls[i]);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        esp_restart();
                     }
                 }
                 prev[i] = curr;
@@ -341,18 +299,7 @@ public:
         InitializeI2cBus();
         InitializeXL9555();
         pca9685_init();
-        /* 注册电机 MCP 工具，AI 可通过语音控制小车 */
-        new MotorController(
-            [](int s) { motor_all( s,  s,  s,  s); },  // 前进
-            [](int s) { motor_all(-s, -s, -s, -s); },  // 后退
-            [](int s) { motor_all( 0,  s,  0,  s); },  // 左转
-            [](int s) { motor_all( s,  0,  s,  0); },  // 右转
-            [](int s) { motor_all( s, -s, -s,  s); },  // 左平移（横移）
-            [](int s) { motor_all(-s,  s,  s, -s); },  // 右平移（横移）
-            [](int s) { motor_all( s, -s,  s, -s); },  // 旋转（正数=顺时针, 负数=逆时针）
-            []()      { motor_stop(); },                 // 停止
-            []()      { motor_test(); }                  // 测 试
-        );
+        motor_test();
         InitializeButtons();
         InitializeST7789Display();
         StartButtonPoller();
