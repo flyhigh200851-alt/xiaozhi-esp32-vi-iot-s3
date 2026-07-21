@@ -30,6 +30,7 @@
 #define MOTOR_RR_DIR1  12  /* CH12 -> BIN1 右后方向 */
 #define MOTOR_RR_DIR2  13  /* CH13 -> BIN2 右后方向 */
 #include "config.h"
+#include "display.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -137,6 +138,16 @@ static void motor_set(int id, int speed) {
     uint16_t pwm = (uint16_t)(abs(speed)*40.95f);
     pca9685_set_pwm(motor_ch[id][1], 0, speed>0?0:4095);
     pca9685_set_pwm(motor_ch[id][2], 0, speed>0?4095:0);
+    /* 平滑起步：逐渐加速到目标值 */
+    if(speed != 0 && pwm > 20) {
+        int step = 20;
+        while(step < pwm) {
+            pca9685_set_pwm(motor_ch[id][0], 0, step);
+            step = step * 3 / 2;
+            if(step > pwm) step = pwm;
+            vTaskDelay(pdMS_TO_TICKS(8));
+        }
+    }
     pca9685_set_pwm(motor_ch[id][0], 0, pwm);
     if(speed==0) {
         pca9685_set_pwm(motor_ch[id][1], 0, 0);
@@ -145,6 +156,13 @@ static void motor_set(int id, int speed) {
 }
 static void motor_all(int fl, int fr, int rl, int rr) {
     motor_set(0,fl); motor_set(1,fr); motor_set(2,rl); motor_set(3,rr);
+}
+
+/* 带屏幕提示的电机控制 */
+static void motor_notify(const char* status, int fl, int fr, int rl, int rr) {
+    auto display = Board::GetInstance().GetDisplay();
+    if (display) display->ShowNotification(status, 2500);
+    motor_all(fl, fr, rl, rr);
 }
 
 static void read_mode1() {
@@ -343,14 +361,14 @@ public:
         pca9685_init();
         /* 注册电机 MCP 工具，AI 可通过语音控制小车 */
         new MotorController(
-            [](int s) { motor_all( s,  s,  s,  s); },  // 前进
-            [](int s) { motor_all(-s, -s, -s, -s); },  // 后退
-            [](int s) { motor_all( 0,  s,  0,  s); },  // 左转
-            [](int s) { motor_all( s,  0,  s,  0); },  // 右转
-            [](int s) { motor_all( s, -s, -s,  s); },  // 左平移（横移）
-            [](int s) { motor_all(-s,  s,  s, -s); },  // 右平移（横移）
-            [](int s) { motor_all( s, -s,  s, -s); },  // 旋转（正数=顺时针, 负数=逆时针）
-            []()      { motor_stop(); },                 // 停止
+            [](int s) { motor_notify("前进",  s,  s,  s,  s); },  // 前进
+            [](int s) { motor_notify("后退", -s, -s, -s, -s); },  // 后退
+            [](int s) { motor_notify("左转",  0,  s,  0,  s); },  // 左转
+            [](int s) { motor_notify("右转",  s,  0,  s,  0); },  // 右转
+            [](int s) { motor_notify("左横移", s, -s, -s,  s); },  // 左平移（横移）
+            [](int s) { motor_notify("右横移",-s,  s,  s, -s); },  // 右平移（横移）
+            [](int s) { motor_notify("旋转",  s, -s,  s, -s); },  // 旋转（正数=顺时针, 负数=逆时针）
+            []()      { auto d = Board::GetInstance().GetDisplay(); if(d) d->ShowNotification("已停止", 1500); motor_stop(); },                 // 停止
             []()      { motor_test(); }                  // 测 试
         );
         InitializeButtons();
