@@ -5,6 +5,17 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+/* 文件级静态变量，供 auto-stop 任务使用 */
+namespace {
+    std::function<void()> g_stop_fn;
+    static void auto_stop_task(void* arg) {
+        int sec = (int)(intptr_t)arg;
+        vTaskDelay(pdMS_TO_TICKS(sec * 1000));
+        if (g_stop_fn) g_stop_fn();
+        vTaskDelete(NULL);
+    }
+}
+
 /* 电机控制器：把四个轮子的运动暴露为 MCP 工具，让 AI 通过语音控制小车身体 */
 /* 注意：这些是"我自己的腿/轮子"，不是"在遥控别的东西" */
 class MotorController {
@@ -29,12 +40,8 @@ public:
             [forward_fn, stop_fn](const PropertyList& props) -> ReturnValue {
                 forward_fn(props["speed"].value<int>());
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
@@ -48,12 +55,8 @@ public:
             [backward_fn, stop_fn](const PropertyList& props) -> ReturnValue {
                 backward_fn(props["speed"].value<int>());
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
@@ -67,12 +70,8 @@ public:
             [turn_left_fn, stop_fn](const PropertyList& props) -> ReturnValue {
                 turn_left_fn(props["speed"].value<int>());
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
@@ -86,12 +85,8 @@ public:
             [turn_right_fn, stop_fn](const PropertyList& props) -> ReturnValue {
                 turn_right_fn(props["speed"].value<int>());
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
@@ -106,12 +101,8 @@ public:
             [strafe_left_fn, stop_fn](const PropertyList& props) -> ReturnValue {
                 strafe_left_fn(props["speed"].value<int>());
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
@@ -126,12 +117,8 @@ public:
             [strafe_right_fn, stop_fn](const PropertyList& props) -> ReturnValue {
                 strafe_right_fn(props["speed"].value<int>());
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
@@ -150,12 +137,8 @@ public:
                 int dir = props["direction"].value<int>();
                 spin_fn(dir > 0 ? speed : -speed);
                 auto sec = props["duration"].value<int>();
-                xTaskCreate([](void* arg) {
-                    int s = (int)(intptr_t)arg;
-                    vTaskDelay(pdMS_TO_TICKS(s * 1000));
-                    stop_fn();
-                    vTaskDelete(NULL);
-                }, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
+                g_stop_fn = stop_fn;
+                xTaskCreate(auto_stop_task, "mtr_auto", 2048, (void*)(intptr_t)sec, 5, NULL);
                 return true;
             });
 
