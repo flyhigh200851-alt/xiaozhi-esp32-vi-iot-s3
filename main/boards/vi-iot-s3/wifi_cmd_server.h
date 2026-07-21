@@ -14,6 +14,7 @@ public:
     WifiCmdServer(CmdHandler handler) {
         xTaskCreate([](void* arg) {
             CmdHandler h = (CmdHandler)arg;
+            vTaskDelay(pdMS_TO_TICKS(12000));
             int sock = socket(AF_INET, SOCK_DGRAM, 0);
             if (sock < 0) { vTaskDelete(NULL); return; }
             struct sockaddr_in addr = {};
