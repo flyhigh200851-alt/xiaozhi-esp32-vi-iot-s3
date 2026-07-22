@@ -49,6 +49,9 @@ void xl9555_init_with_bus(i2c_master_bus_handle_t bus);
 #include "settings.h"
 #include "motor_controller.h"
 #include <esp_system.h>
+#include <driver/uart.h>
+#include <esp_rom_sys.h>
+#include <esp_timer.h>
 
 #define TAG "VI-IOT-S3"
 
@@ -161,6 +164,50 @@ static void motor_all(int fl, int fr, int rl, int rr) {
 
 /* 带屏幕提示的电机控制 */
 struct CarStatus { int speed=0; const char* dir="停止"; const char* mode="语音"; const char* model="云小智"; int dist=-1; bool radar=false; char speech[256]={0}; };
+
+/* 超声波 GPIO16 */
+#define ULTRA_GPIO GPIO_NUM_16
+#define RADAR_UART UART_NUM_2
+#define RADAR_GPIO GPIO_NUM_18
+
+static int read_ultrasonic() {
+    gpio_set_direction(ULTRA_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(ULTRA_GPIO, 1);
+    esp_rom_delay_us(12);
+    gpio_set_level(ULTRA_GPIO, 0);
+    gpio_set_direction(ULTRA_GPIO, GPIO_MODE_INPUT);
+    int64_t t0 = esp_timer_get_time();
+    while (gpio_get_level(ULTRA_GPIO) == 0 && (esp_timer_get_time() - t0) < 15000);
+    int64_t t1 = esp_timer_get_time();
+    while (gpio_get_level(ULTRA_GPIO) == 1 && (esp_timer_get_time() - t1) < 30000);
+    int64_t t2 = esp_timer_get_time();
+    int dur = (int)(t2 - t1);
+    return (dur < 5 || dur > 25000) ? -1 : dur / 58;
+}
+
+extern CarStatus g_cs;
+
+static void radar_task(void*) {
+    uart_config_t ucfg = {
+        .baud_rate = 256000, .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(RADAR_UART, 1024, 0, 0, NULL, 0);
+    uart_param_config(RADAR_UART, &ucfg);
+    uart_set_pin(RADAR_UART, UART_PIN_NO_CHANGE, RADAR_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uint8_t buf[32];
+    while (1) {
+        int len = uart_read_bytes(RADAR_UART, buf, sizeof(buf), pdMS_TO_TICKS(200));
+        for (int i = 0; i < len - 7; i++) {
+            if (buf[i]==0xF4 && buf[i+1]==0xF5 && buf[i+2]==0xF6 && buf[i+3]==0xF7 && buf[i+4]==0xAA) {
+                g_cs.radar = (buf[i+6] != 0x00);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
 CarStatus g_cs;
 
 static void motor_notify(const char* status, int fl, int fr, int rl, int rr) {
@@ -206,8 +253,8 @@ void web_cmd_callback(const char* cmd, int val) {
     else if (!strcmp(cmd,"B")){ motor_all(-val,-val,-val,-val); g_cs.dir="后退"; }
     else if (!strcmp(cmd,"L")){ motor_all(0,val,0,val); g_cs.dir="左转"; }
     else if (!strcmp(cmd,"R")){ motor_all(val,0,val,0); g_cs.dir="右转"; }
-    else if (!strcmp(cmd,"SL")){ motor_all(val,-val,-val,val); g_cs.dir="左横移"; }
-    else if (!strcmp(cmd,"SR")){ motor_all(-val,val,val,-val); g_cs.dir="右横移"; }
+    else if (!strcmp(cmd,"SL")){ motor_all(-val,val,val,-val); g_cs.dir="左横移"; }
+    else if (!strcmp(cmd,"SR")){ motor_all(val,-val,-val,val); g_cs.dir="右横移"; }
     else if (!strcmp(cmd,"C")){ motor_all(val,-val,val,-val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"CC")){ motor_all(-val,val,-val,val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"S")){ motor_stop(); g_cs.dir="停止"; g_cs.speed=0; }
@@ -224,6 +271,7 @@ static void status_broadcast(void*) {
         cJSON* j = cJSON_CreateObject();
         cJSON_AddNumberToObject(j,"speed",g_cs.speed);
         cJSON_AddStringToObject(j,"dir",g_cs.dir);
+        int d = read_ultrasonic(); if(d>0) g_cs.dist=d;
         cJSON_AddNumberToObject(j,"dist",g_cs.dist);
         cJSON_AddBoolToObject(j,"radar",g_cs.radar);
         cJSON_AddStringToObject(j,"mode",g_cs.mode);
@@ -404,8 +452,8 @@ public:
             [](int s) { g_cs.speed=s; motor_notify("后退", -s, -s, -s, -s); },
             [](int s) { g_cs.speed=s; motor_notify("左转",  0,  s,  0,  s); },
             [](int s) { g_cs.speed=s; motor_notify("右转",  s,  0,  s,  0); },
-            [](int s) { g_cs.speed=s; motor_notify("左横移", s, -s, -s,  s); },
-            [](int s) { g_cs.speed=s; motor_notify("右横移",-s,  s,  s, -s); },
+            [](int s) { g_cs.speed=s; motor_notify("左横移", -s, s, s, -s); },
+            [](int s) { g_cs.speed=s; motor_notify("右横移", s, -s, -s, s); },
             [](int s) { g_cs.speed=s; motor_notify("旋转",  s, -s,  s, -s); },
             []()      { g_cs.dir="停止";g_cs.speed=0; motor_stop(); },
             []()      { motor_test(); }
@@ -415,6 +463,7 @@ public:
         StartButtonPoller();
         new WifiCmdServer(web_cmd_callback);
         xTaskCreate(status_broadcast, "stat_udp", 4096, NULL, 5, NULL);
+        xTaskCreate(radar_task, "radar", 4096, NULL, 5, NULL);
     }
 
     virtual AudioCodec* GetAudioCodec() override {

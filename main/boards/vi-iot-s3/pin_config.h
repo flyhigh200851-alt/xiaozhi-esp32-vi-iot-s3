@@ -37,7 +37,7 @@
 #define AUDIO_I2S_DIN               GPIO_NUM_15 /* I2S 数据输入(从codec) */
 
 /* ============ WS2812 LED ============ */
-#define WS2812_GPIO_NUM             GPIO_NUM_18
+#define WS2812_GPIO_NUM             GPIO_NUM_NC
 
 /* ============ 按键 ============ */
 #define BOOT_BUTTON_GPIO            GPIO_NUM_0
