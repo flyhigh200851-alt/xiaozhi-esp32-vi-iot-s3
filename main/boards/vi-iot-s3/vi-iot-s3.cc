@@ -1,4 +1,6 @@
 #include "wifi_board.h"
+#include "sensors.h"
+#include <cstring>
 #include "audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
@@ -186,6 +188,10 @@ static int read_ultrasonic() {
 }
 
 extern CarStatus g_cs;
+Sensors g_sensors;
+SensorData g_sd;
+bool g_exploring = false;
+#define AUDIO_UDP_PORT 8887
 
 static void radar_task(void*) {
     uart_config_t ucfg = {
@@ -258,6 +264,29 @@ void web_cmd_callback(const char* cmd, int val) {
     else if (!strcmp(cmd,"C")){ motor_all(val,-val,val,-val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"CC")){ motor_all(-val,val,-val,val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"S")){ motor_stop(); g_cs.dir="停止"; g_cs.speed=0; }
+    else if (!strcmp(cmd,"EXPLORE")){
+        g_exploring = true; g_cs.speed = 50; g_cs.dir = "探索"; motor_all(50,50,50,50);
+    }
+    else if (!strcmp(cmd,"STOPEXP")){
+        g_exploring = false; motor_stop(); g_cs.dir = "停止"; g_cs.speed = 0;
+    }
+    else if (!strcmp(cmd,"LISTEN")){
+        ESP_LOGI(TAG, "Activate conversation via dashboard");
+        Application::GetInstance().StartListening();
+    }
+    else if (!strcmp(cmd,"NETMIC")){
+        ESP_LOGI(TAG, "Remote mic mode");
+        Application::GetInstance().StartListening();
+    }
+    else if (!strcmp(cmd,"M")){
+        const char* urls[] = {"", "http://192.168.31.92:8003/xiaozhi/ota/", "http://192.168.31.92:8004/xiaozhi/ota/", "http://192.168.31.92:8006/xiaozhi/ota/"};
+        if (val >= 1 && val <= 4) {
+            Settings s("wifi", true);
+            s.SetString("ota_url", urls[val-1]);
+            vTaskDelay(200);
+            esp_restart();
+        }
+    }
     else if (!strcmp(cmd,"T")){ motor_test(); }
 }
 
@@ -446,6 +475,7 @@ public:
         InitializeI2cBus();
         InitializeXL9555();
         pca9685_init();
+        g_sensors.InitAll();
         /* 注册电机 MCP 工具，AI 可通过语音控制小车 */
         new MotorController(
             [](int s) { g_cs.speed=s; motor_notify("前进",  s,  s,  s,  s); },
@@ -463,7 +493,113 @@ public:
         StartButtonPoller();
         new WifiCmdServer(web_cmd_callback);
         xTaskCreate(status_broadcast, "stat_udp", 4096, NULL, 5, NULL);
-        xTaskCreate(radar_task, "radar", 4096, NULL, 5, NULL);
+        // Init sensors
+        g_sensors.InitAll();
+        // Chat message callback for dashboard
+        Application::GetInstance().SetChatMessageCallback([](const std::string& role, const std::string& text) {
+            std::string formatted;
+            if (role == "user") {
+                formatted = "\xe4\xbd\xa0\xe8\xaf\xb4: " + text;
+            } else {
+                formatted = "\xe5\xb0\x8f\xe6\x99\xba: " + text;
+            }
+            strncpy(g_cs.speech, formatted.c_str(), sizeof(g_cs.speech) - 1);
+            g_cs.speech[sizeof(g_cs.speech) - 1] = '\0';
+        });
+        // MCP tools for explore and sensor
+        {
+            auto& mcp = McpServer::GetInstance();
+            mcp.AddTool("self.motor.explore",
+                "Start autonomous exploration mode. The car drives forward and avoids obstacles.",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    g_exploring = true; g_cs.speed = 50; g_cs.dir = "\xe6\x8e\xa2\xe7\xb4\xa2";
+                    motor_all(50,50,50,50); return true;
+                });
+            mcp.AddTool("self.motor.stop_explore",
+                "Stop exploration mode and stop the car.",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    g_exploring = false; motor_stop();
+                    g_cs.dir = "\xe5\x81\x9c\xe6\xad\xa2"; g_cs.speed = 0; return true;
+                });
+            mcp.AddTool("self.sensor.get_readings",
+                "Get current sensor readings (temperature, humidity, distance, roll, pitch).",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "{\"temperature\":%.1f,\"humidity\":%.0f,\"distance_mm\":%d,\"roll\":%.1f,\"pitch\":%.1f}",
+                        g_sd.temp, g_sd.hum, g_sd.dist, g_sd.roll, g_sd.pitch);
+                    return std::string(buf);
+                });
+        }
+        // Audio UDP receiver
+        xTaskCreate([](void*) {
+            vTaskDelay(pdMS_TO_TICKS(6000));
+            ESP_LOGI(TAG, "Audio UDP receiver starting on port %d", AUDIO_UDP_PORT);
+            int sock = socket(AF_INET, SOCK_DGRAM, 0);
+            struct sockaddr_in addr = {};
+            addr.sin_family = AF_INET; addr.sin_port = htons(AUDIO_UDP_PORT);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                ESP_LOGE(TAG, "Failed to bind audio UDP port %d", AUDIO_UDP_PORT);
+                close(sock); vTaskDelete(NULL); return;
+            }
+            ESP_LOGI(TAG, "Audio UDP receiver ready on port %d", AUDIO_UDP_PORT);
+            int16_t pcm_buf[960];
+            uint32_t ts = 0;
+            while (1) {
+                int len = recvfrom(sock, pcm_buf, sizeof(pcm_buf), 0, NULL, NULL);
+                if (len == sizeof(pcm_buf)) {
+                    auto& svc = Application::GetInstance().GetAudioService();
+                    svc.PushPcmToSendQueue(pcm_buf, 960, ts++);
+                }
+            }
+            close(sock); vTaskDelete(NULL);
+        }, "audio_udp", 4096, NULL, 4, NULL);
+        // Sensor read + exploration task
+        xTaskCreate([](void*) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            uint32_t last_wander = 0;
+            while (1) {
+                g_sd = g_sensors.ReadAll();
+                uint32_t now = esp_timer_get_time() / 1000;
+                if(g_cs.speed > 0 && g_sd.dist_ok){
+                    uint16_t d = g_sd.dist;
+                    if(g_exploring){
+                        if(d > 0 && d < 350){
+                            ESP_LOGI(TAG, "DANGER avoid %dmm", d);
+                            motor_stop(); g_cs.speed = 0;
+                            vTaskDelay(pdMS_TO_TICKS(80));
+                            motor_all(-45,-45,-45,-45); vTaskDelay(pdMS_TO_TICKS(500)); motor_stop();
+                            if(rand()%2){ motor_all(40,-40,40,-40); }
+                            else { motor_all(-40,40,-40,40); }
+                            vTaskDelay(pdMS_TO_TICKS(500 + rand()%700)); motor_stop();
+                            motor_all(50,50,50,50); g_cs.speed = 50;
+                        } else if(d >= 350 && d < 600){
+                            if(g_cs.speed > 25){ motor_all(25,25,25,25); g_cs.speed = 25; ESP_LOGI(TAG, "SLOW %dmm", d); }
+                        } else if(d >= 600 && d < 900){
+                            if(g_cs.speed > 40){ motor_all(35,35,35,35); g_cs.speed = 35; }
+                        } else {
+                            if(g_cs.speed < 50){ motor_all(50,50,50,50); g_cs.speed = 50; }
+                        }
+                        if(now - last_wander > 8000 + (rand()%5000)){
+                            last_wander = now;
+                            int t = 200 + rand()%600;
+                            if(rand()%2){ motor_all(40,-40,40,-40); }
+                            else { motor_all(-40,40,-40,40); }
+                            vTaskDelay(pdMS_TO_TICKS(t)); motor_stop();
+                            motor_all(50,50,50,50); g_cs.speed = 50;
+                            ESP_LOGI(TAG, "WANDER %dms", t);
+                        }
+                    } else {
+                        if(d > 0 && d < 200){ motor_stop(); g_cs.speed = 0; ESP_LOGI(TAG, "AUTO-STOP %dmm", d); }
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        }, "sensor_read", 4096, NULL, 4, NULL);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
