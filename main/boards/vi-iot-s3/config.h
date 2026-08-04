@@ -22,7 +22,7 @@
 #define AUDIO_CODEC_ES7210_ADDR  0x82
 
 /* 板载资源 */
-#define BUILTIN_LED_GPIO        GPIO_NUM_4
+#define BUILTIN_LED_GPIO        GPIO_NUM_18
 #define BOOT_BUTTON_GPIO        GPIO_NUM_0
 
 /* ST7789 屏幕参数 */

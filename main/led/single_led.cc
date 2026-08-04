@@ -19,7 +19,7 @@ SingleLed::SingleLed(gpio_num_t gpio) {
 
     led_strip_config_t strip_config = {};
     strip_config.strip_gpio_num = gpio;
-    strip_config.max_leds = 1;
+    strip_config.max_leds = 3;
     strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
     strip_config.led_model = LED_MODEL_WS2812;
 
@@ -65,7 +65,7 @@ void SingleLed::TurnOn() {
     
     std::lock_guard<std::mutex> lock(mutex_);
     esp_timer_stop(blink_timer_);
-    led_strip_set_pixel(led_strip_, 0, r_, g_, b_);
+    for (int i = 0; i < 3; i++) led_strip_set_pixel(led_strip_, i, r_, g_, b_);
     led_strip_refresh(led_strip_);
 }
 
@@ -121,6 +121,9 @@ void SingleLed::OnBlinkTimer() {
 
 
 void SingleLed::OnStateChanged() {
+    if (user_override_) {
+        return;  // 用户设置了颜色，状态机不覆盖
+    }
     auto& app = Application::GetInstance();
     auto device_state = app.GetDeviceState();
     switch (device_state) {

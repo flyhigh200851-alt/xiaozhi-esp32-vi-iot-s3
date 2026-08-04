@@ -181,15 +181,28 @@ public:
         mpu_ok=true;ESP_LOGI("SENS","MPU6050 ready");return true;
     }
     bool ReadMPU6050(float& roll,float& pitch,float& yaw){
-        uint8_t r[6];
+        uint8_t r[14];  // Read all: accel(6)+temp(2)+gyro(6)
         for(int retry=0;retry<3;retry++){
-            if(sw_read_bytes(MPU_ADDR,0x3B,r,6)){
+            if(sw_read_bytes(MPU_ADDR,0x3B,r,14)){
                 int16_t ax=(r[0]<<8)|r[1],ay=(r[2]<<8)|r[3],az=(r[4]<<8)|r[5];
-                ESP_LOGI("MPU","ax=%d ay=%d az=%d",ax,ay,az);
+                int16_t gz=(r[12]<<8)|r[13];  // Gyro Z from 0x47-0x48
+                
+                // Accelerometer -> roll/pitch
                 float accX=ax/16384.0f,accY=ay/16384.0f,accZ=az/16384.0f;
                 if(fabsf(accX)<0.001f&&fabsf(accY)<0.001f&&fabsf(accZ)<0.001f){vTaskDelay(1);continue;}
                 roll=atan2f(accY,accZ)*57.2958f;
                 pitch=atan2f(-accX,sqrtf(accY*accY+accZ*accZ))*57.2958f;
+                
+                // Gyro Z -> yaw integration
+                float yaw_rate = gz / 16.4f;  // +/-2000deg/s -> 16.4 LSB/deg/s
+                uint64_t now = esp_timer_get_time();
+                if(last_us == 0){ last_us = now; }
+                float dt = (now - last_us) / 1000000.0f;
+                last_us = now;
+                if(dt > 0.5f) dt = 0;  // Ignore large gaps
+                yaw_accum += yaw_rate * dt;
+                yaw = yaw_accum;
+                
                 return true;
             }
             vTaskDelay(pdMS_TO_TICKS(10));

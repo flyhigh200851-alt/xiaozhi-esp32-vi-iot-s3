@@ -14,8 +14,21 @@ public:
     virtual ~SingleLed();
 
     void OnStateChanged() override;
+    void SetLedColor(uint8_t r, uint8_t g, uint8_t b) {
+        SetColor(r, g, b);
+        user_override_ = true;  // 用户控制优先，关灯后状态机也不接管
+        if (led_strip_) {
+            for (int i = 0; i < 3; i++) led_strip_set_pixel(led_strip_, i, r, g, b);
+            led_strip_refresh(led_strip_);
+        }
+    }
+    void RestoreAutoLed() {
+        user_override_ = false;
+        OnStateChanged();  // 立即恢复状态机颜色
+    }
 
 private:
+    bool user_override_ = false;
     std::mutex mutex_;
     TaskHandle_t blink_task_ = nullptr;
     led_strip_handle_t led_strip_ = nullptr;

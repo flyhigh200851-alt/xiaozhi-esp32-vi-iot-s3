@@ -1070,6 +1070,8 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_i2s
                         esp_driver_jpeg
                         esp_driver_ppa
+                        esp_driver_rmt
+                        espressif__led_strip
                         esp_app_format
                         app_update
                         spi_flash

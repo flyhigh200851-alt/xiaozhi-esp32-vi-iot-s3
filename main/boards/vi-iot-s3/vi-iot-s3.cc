@@ -1,5 +1,9 @@
 #include "wifi_board.h"
 #include "sensors.h"
+#include "driver/rmt_tx.h"
+#include "esp_http_server.h"
+#include "websocket_control_server.h"
+#include "driver/rmt_encoder.h"
 #include <cstring>
 #include "audio_codec.h"
 #include "display/lcd_display.h"
@@ -7,6 +11,8 @@
 #include "button.h"
 #include "led/single_led.h"
 #include "pin_config.h"
+#include "esp_timer.h"
+#include <inttypes.h>
 
 /* ============ PCA9685 I2C 电机驱动 ============ */
 #define PCA9685_ADDR        0x40
@@ -167,31 +173,13 @@ static void motor_all(int fl, int fr, int rl, int rr) {
 /* 带屏幕提示的电机控制 */
 struct CarStatus { int speed=0; const char* dir="停止"; const char* mode="语音"; const char* model="云小智"; int dist=-1; bool radar=false; char speech[256]={0}; };
 
+CarStatus g_cs;
+#define AUDIO_UDP_PORT 8887
+
 /* 超声波 GPIO16 */
 #define ULTRA_GPIO GPIO_NUM_16
 #define RADAR_UART UART_NUM_2
 #define RADAR_GPIO GPIO_NUM_18
-
-static int read_ultrasonic() {
-    gpio_set_direction(ULTRA_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(ULTRA_GPIO, 1);
-    esp_rom_delay_us(12);
-    gpio_set_level(ULTRA_GPIO, 0);
-    gpio_set_direction(ULTRA_GPIO, GPIO_MODE_INPUT);
-    int64_t t0 = esp_timer_get_time();
-    while (gpio_get_level(ULTRA_GPIO) == 0 && (esp_timer_get_time() - t0) < 15000);
-    int64_t t1 = esp_timer_get_time();
-    while (gpio_get_level(ULTRA_GPIO) == 1 && (esp_timer_get_time() - t1) < 30000);
-    int64_t t2 = esp_timer_get_time();
-    int dur = (int)(t2 - t1);
-    return (dur < 5 || dur > 25000) ? -1 : dur / 58;
-}
-
-extern CarStatus g_cs;
-Sensors g_sensors;
-SensorData g_sd;
-bool g_exploring = false;
-#define AUDIO_UDP_PORT 8887
 
 static void radar_task(void*) {
     uart_config_t ucfg = {
@@ -214,7 +202,9 @@ static void radar_task(void*) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
-CarStatus g_cs;
+Sensors g_sensors;
+SensorData g_sd;
+bool g_exploring = false;
 
 static void motor_notify(const char* status, int fl, int fr, int rl, int rr) {
     g_cs.dir = status;
@@ -253,6 +243,352 @@ static void RunMotorTestTask(void* param) {
     vTaskDelete(NULL);
 }
 
+/* 陀螺仪闭环转向 */
+static volatile bool g_gyro_turning = false;
+static void gyro_turn_task(void* arg);
+static void gyro_turn_start(int degrees);
+
+/* ============ 红外发射 + 红外学习 ============ */
+#define IR_TX_GPIO   GPIO_NUM_16
+#define IR_RX_GPIO   GPIO_NUM_14
+
+#define IR_PROTO_NEC    0
+#define IR_PROTO_MEIDEA 1
+
+static rmt_channel_handle_t ir_tx_chan = NULL;
+static rmt_encoder_handle_t ir_tx_encoder = NULL;
+#define IR_SLOT_COUNT 30
+static uint64_t g_ir_codes[IR_SLOT_COUNT] = {0};
+static int g_ir_protocol[IR_SLOT_COUNT] = {0};
+static int g_ir_learn_slot = 0;
+static volatile bool g_ir_learning = false;
+static volatile uint32_t g_ir_edges[200];
+static volatile int g_ir_edge_count = 0;
+
+static void ir_load_codes() {
+    Settings s("ir", true);
+    for (int i = 0; i < IR_SLOT_COUNT; i++) {
+        std::string hex = s.GetString(("code" + std::to_string(i)).c_str(), "");
+        g_ir_protocol[i] = s.GetInt(("proto" + std::to_string(i)).c_str(), 0);
+        if (!hex.empty()) {
+            g_ir_codes[i] = strtoull(hex.c_str(), NULL, 16);
+        }
+    }
+    ESP_LOGI("IR", "Loaded %d IR codes from NVS", IR_SLOT_COUNT);
+}
+
+static void ir_save_code(int slot) {
+    if (slot < 0 || slot >= IR_SLOT_COUNT) return;
+    Settings s("ir", true);
+    char buf[32];
+    uint32_t hi = (uint32_t)(g_ir_codes[slot] >> 32);
+    uint32_t lo = (uint32_t)(g_ir_codes[slot] & 0xFFFFFFFF);
+    snprintf(buf, sizeof(buf), "%08X%08X", (unsigned int)hi, (unsigned int)lo);
+    s.SetString(("code" + std::to_string(slot)).c_str(), buf);
+    s.SetInt(("proto" + std::to_string(slot)).c_str(), g_ir_protocol[slot]);
+    ESP_LOGI("IR", "Saved slot %d = %s proto=%d", slot, buf, g_ir_protocol[slot]);
+}
+
+static void ir_notify_learned(int slot) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return;
+    struct sockaddr_in dest = {};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(50002);
+    dest.sin_addr.s_addr = inet_addr("192.168.31.92");
+    char buf[96];
+    uint32_t hi = (uint32_t)(g_ir_codes[slot] >> 32);
+    uint32_t lo = (uint32_t)(g_ir_codes[slot] & 0xFFFFFFFF);
+    snprintf(buf, sizeof(buf), "IR_LEARNED %d %08X%08X %d",
+        slot, (unsigned int)hi, (unsigned int)lo, g_ir_protocol[slot]);
+    sendto(sock, buf, strlen(buf), 0, (struct sockaddr*)&dest, sizeof(dest));
+    close(sock);
+    ESP_LOGI("IR", "UDP notify sent: %s", buf);
+}
+
+static void ir_init() {
+    // RMT TX for IR emitter (GPIO16)
+    rmt_tx_channel_config_t tx_cfg = {};
+    tx_cfg.gpio_num = IR_TX_GPIO;
+    tx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
+    tx_cfg.resolution_hz = 1000000;
+    tx_cfg.mem_block_symbols = 64;
+    tx_cfg.trans_queue_depth = 4;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &ir_tx_chan));
+    rmt_copy_encoder_config_t copy_cfg = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&copy_cfg, &ir_tx_encoder));
+    ESP_ERROR_CHECK(rmt_enable(ir_tx_chan));
+    // 硬件 38kHz 载波：电平为高时自动叠加载波，只发包络即可
+    rmt_carrier_config_t carrier_cfg = {};
+    carrier_cfg.frequency_hz = 38000;
+    carrier_cfg.duty_cycle = 0.33f;
+    ESP_ERROR_CHECK(rmt_apply_carrier(ir_tx_chan, &carrier_cfg));
+
+    // IR receiver (GPIO14) via GPIO ISR
+    gpio_config_t rx_cfg = {};
+    rx_cfg.pin_bit_mask = 1ULL << IR_RX_GPIO;
+    rx_cfg.mode = GPIO_MODE_INPUT;
+    rx_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    rx_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    rx_cfg.intr_type = GPIO_INTR_ANYEDGE;
+    gpio_config(&rx_cfg);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(IR_RX_GPIO, [](void*){
+        uint32_t now = esp_timer_get_time();
+        if(g_ir_edge_count < 199) { g_ir_edges[g_ir_edge_count++] = now; }
+    }, NULL);
+
+    ir_load_codes();
+    ESP_LOGI(TAG, "IR TX=GPIO16 RX=GPIO14 ready");
+}
+
+static void ir_send(uint64_t code, int protocol) {
+    rmt_symbol_word_t sym[64];
+    int n = 0;
+    int bits = (protocol == IR_PROTO_MEIDEA) ? 48 : 32;
+    int leader_on = (protocol == IR_PROTO_MEIDEA) ? 4500 : 9000;
+    // Leader: 高(硬件载波) + 低
+    sym[n++] = (rmt_symbol_word_t){ .duration0=(uint16_t)leader_on, .level0=1,
+                                    .duration1=(uint16_t)4500, .level1=0 };
+    // 数据位
+    for(int i=0;i<bits;i++) {
+        bool bit = (code >> i) & 1;
+        sym[n++] = (rmt_symbol_word_t){ .duration0=560, .level0=1,
+                                        .duration1=(uint16_t)(bit?1690:560), .level1=0 };
+    }
+    // Stop
+    sym[n++] = (rmt_symbol_word_t){ .duration0=560, .level0=1, .duration1=0, .level1=0 };
+    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+    rmt_transmit(ir_tx_chan, ir_tx_encoder, sym, n*sizeof(rmt_symbol_word_t), &tx_cfg);
+    rmt_tx_wait_all_done(ir_tx_chan, portMAX_DELAY);
+    ESP_LOGI("IR", "Sent proto=%d code=0x%08X%08X (%d symbols)",
+        protocol, (unsigned int)(uint32_t)(code>>32), (unsigned int)(uint32_t)code, n);
+}
+
+/* 自动识别协议并解码：
+   NEC:   leader 9ms + 4.5ms, 32 bit
+   美的:  leader 4.5ms + 4.5ms, 48 bit
+   位编码相同：low 560us, high 560(0)/1690(1) */
+static int ir_decode(uint64_t& code, int& protocol) {
+    int cnt = g_ir_edge_count;
+    if(cnt < 70) return -1;
+    uint32_t leader = g_ir_edges[1] - g_ir_edges[0];
+    int bits = 0;
+    if (leader >= 8000 && leader <= 10000) {
+        protocol = IR_PROTO_NEC;
+        bits = 32;
+    } else if (leader >= 4000 && leader <= 5500) {
+        protocol = IR_PROTO_MEIDEA;
+        bits = 48;
+    } else {
+        ESP_LOGW("IR", "Unknown leader %dus", leader);
+        return -1;
+    }
+    uint64_t c = 0;
+    int e = 2;
+    for(int i=0;i<bits;i++) {
+        if(e + 3 > cnt) return -1;
+        uint32_t low = g_ir_edges[e+1] - g_ir_edges[e];
+        if(low < 400 || low > 700) return -1;
+        uint32_t high = g_ir_edges[e+2] - g_ir_edges[e+1];
+        if(high > 1000) c |= (1ULL << i);
+        e += 2;
+    }
+    code = c;
+    return 0;
+}
+
+static void ir_learn_task(void* arg) {
+    while(1) {
+        if(g_ir_learning) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if(g_ir_edge_count >= 70) {
+                uint64_t code = 0;
+                int protocol = 0;
+                if(ir_decode(code, protocol) == 0 && code) {
+                    if (g_ir_learn_slot >= 0 && g_ir_learn_slot < IR_SLOT_COUNT) {
+                        g_ir_codes[g_ir_learn_slot] = code;
+                        g_ir_protocol[g_ir_learn_slot] = protocol;
+                        ir_save_code(g_ir_learn_slot);
+                        ir_notify_learned(g_ir_learn_slot);
+                        uint32_t hi = (uint32_t)(code >> 32);
+                        uint32_t lo = (uint32_t)(code & 0xFFFFFFFF);
+                        ESP_LOGI("IR", "Learned slot %d: proto=%d code=0x%08X%08X", g_ir_learn_slot, protocol, (unsigned int)hi, (unsigned int)lo);
+                    } else {
+                        ESP_LOGW("IR", "Learn slot invalid: %d", g_ir_learn_slot);
+                    }
+                    g_ir_learning = false;
+                    }
+                g_ir_edge_count = 0;
+            }
+        } else {
+            g_ir_edge_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+}
+
+
+/* ============ 网页控制 (WebSocket + 状态) ============ */
+void web_cmd_callback(const char* cmd, int val);
+static void split_cmd(const char* s, char* cmd, int* val) {
+    int i = 0;
+    while (s[i] && !(s[i]>='0'&&s[i]<='9') && s[i] != '-') { cmd[i]=s[i]; i++; }
+    cmd[i]='\0';
+    *val = atoi(s+i);
+}
+
+static esp_err_t car_cmd_handler(httpd_req_t* req) {
+    char buf[64] = {0};
+    int len = httpd_req_get_url_query_len(req);
+    if (len > 0 && len < 64) {
+        httpd_req_get_url_query_str(req, buf, sizeof(buf));
+    }
+    char cmd[32] = {0};
+    int val = 0;
+    char c_param[32] = {0};
+    if (httpd_query_key_value(buf, "c", c_param, sizeof(c_param)) == ESP_OK) {
+        split_cmd(c_param, cmd, &val);
+        ESP_LOGI("WEB", "cmd=%s val=%d", cmd, val);
+        web_cmd_callback(cmd, val);
+    }
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "OK");
+}
+
+static esp_err_t car_status_handler(httpd_req_t* req) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"speed\":%d,\"temp\":%.1f,\"hum\":%.0f,\"dist\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"uptime\":%lld}",
+        g_cs.speed, g_sd.temp, g_sd.hum, g_sd.dist, g_sd.roll, g_sd.pitch,
+        (long long)(esp_timer_get_time() / 1000000));
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static const char* kCarHtml = R"HTML(
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>小智小车</title><style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:sans-serif}
+body{background:#0d1117;color:#e6edf3;padding:12px;padding-bottom:30px}
+h1{font-size:20px;margin-bottom:8px;color:#58a6ff}
+.st{display:grid;grid-template-columns:repeat(auto-fit,minmax(74px,1fr));gap:6px;margin-bottom:12px}
+.sc{background:#161b22;border-radius:8px;padding:8px;text-align:center}
+.sc .l{font-size:10px;color:#8b949e}.sc .v{font-size:18px;font-weight:700;color:#58a6ff}
+.dpad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:240px;margin:0 auto 12px}
+.dpad button{background:#21262d;border:none;color:#e6edf3;font-size:24px;padding:14px;border-radius:10px;cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none}
+.dpad button:active{background:#30363d}
+.dpad .s{background:#581010}
+.row{display:flex;gap:6px;margin-bottom:10px}
+.row button{flex:1;background:#21262d;border:none;color:#e6edf3;padding:10px;border-radius:8px;cursor:pointer;font-size:13px}
+.row button:active{background:#30363d}
+.row button.g{background:#0e4429}.row button.r{background:#581010}
+#wsd,#up{text-align:center;font-size:11px;color:#8b949e;margin-bottom:8px}
+</style></head><body>
+<h1>&#x1F697; 小智小车</h1>
+<div id="wsd">连接中...</div>
+<div id="up">运行 --</div>
+<div class="st">
+<div class="sc"><div class="l">速度</div><div class="v" id="sp">0%</div></div>
+<div class="sc"><div class="l">温度</div><div class="v" id="tp">--</div></div>
+<div class="sc"><div class="l">湿度</div><div class="v" id="hm">--</div></div>
+<div class="sc"><div class="l">距离</div><div class="v" id="ds">--</div></div>
+</div>
+<div class="dpad">
+<div></div><button class="mv" data-cmd="self.motor.forward" data-args='{"speed":60,"duration":5}'>&#x2B06;</button><div></div>
+<button class="mv" data-cmd="self.motor.turn_left" data-args='{"speed":45,"duration":5}'>&#x2B05;</button><button class="s" onclick="c('self.motor.stop','{}')">&#x23F9;</button><button class="mv" data-cmd="self.motor.turn_right" data-args='{"speed":45,"duration":5}'>&#x27A1;</button>
+<div></div><button class="mv" data-cmd="self.motor.backward" data-args='{"speed":60,"duration":5}'>&#x2B07;</button><div></div>
+</div>
+<div class="row"><button class="g" onclick="c('self.motor.explore','{}')">探索</button><button class="r" onclick="c('self.motor.stop_explore','{}')">停止</button></div>
+<script>
+var ws=null,reT=null,holdTimer=null;
+var d=document.getElementById('wsd');
+function fmtUp(u){
+ if(!u)return '运行 --';
+ if(u<60)return '运行 '+u+'秒';
+ return '运行 '+Math.floor(u/60)+'分'+(u%60)+'秒';
+}
+function connect(){
+ clearTimeout(reT);
+ ws=new WebSocket('ws://'+location.host+'/ws');
+ ws.onopen=function(){d.textContent='已连接';};
+ ws.onclose=function(){
+  d.textContent='已断开，自动重连中';
+  if(holdTimer){clearInterval(holdTimer);holdTimer=null;}
+  reT=setTimeout(connect,2000);
+ };
+ ws.onerror=function(){try{ws.close();}catch(e){}};
+}
+connect();
+var seq=1;
+function c(name,args){
+ if(ws.readyState!==1)return;
+ ws.send(JSON.stringify({type:'mcp',payload:{jsonrpc:'2.0',id:seq++,method:'tools/call',params:{name:name,arguments:JSON.parse(args||'{}')}}}));
+}
+function startMove(b){
+ if(!b.dataset.cmd)return;
+ stopMove();
+ var go=function(){c(b.dataset.cmd,b.dataset.args||'{}');};
+ go();
+ holdTimer=setInterval(go,2000);
+}
+function stopMove(){
+ if(holdTimer){clearInterval(holdTimer);holdTimer=null;}
+ c('self.motor.stop','{}');
+}
+var mv=document.querySelectorAll('.dpad .mv');
+for(var i=0;i<mv.length;i++){
+ (function(b){
+  b.addEventListener('pointerdown',function(e){e.preventDefault();startMove(b);});
+  ['pointerup','pointercancel','pointerleave'].forEach(function(ev){
+   b.addEventListener(ev,function(e){e.preventDefault();stopMove();});
+  });
+ })(mv[i]);
+}
+setInterval(function(){
+ fetch('/api/status').then(function(r){return r.json()}).then(function(s){
+  document.getElementById('sp').textContent=(s.speed||0)+'%';
+  document.getElementById('tp').textContent=s.temp?s.temp.toFixed(1)+'C':'--';
+  document.getElementById('hm').textContent=s.hum?s.hum.toFixed(0)+'%':'--';
+  document.getElementById('ds').textContent=(s.dist&&s.dist<2000?s.dist+'mm':'--');
+  document.getElementById('up').textContent=fmtUp(s.uptime);
+ }).catch(function(){});
+},1000);
+</script></body></html>
+)HTML";
+
+static esp_err_t car_root_handler(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, kCarHtml);
+}
+
+static void start_car_web_server() {
+    // 只启动一个 httpd(8080)：WebSocket 控制 + 状态接口都在这
+    static WebSocketControlServer ws_server;
+    if (!ws_server.Start(8080)) {
+        ESP_LOGE(TAG, "Failed to start WebSocket server");
+        return;
+    }
+    httpd_uri_t s = {"/api/status", HTTP_GET, car_status_handler, NULL};
+    httpd_uri_t root = {"/", HTTP_GET, car_root_handler, NULL};
+    bool ok = (ws_server.RegisterUri(&s) == ESP_OK) && (ws_server.RegisterUri(&root) == ESP_OK);
+    if (ok) {
+        ESP_LOGI(TAG, "Web: http://192.168.31.142:8080/  ws://192.168.31.142:8080/ws");
+    } else {
+        ESP_LOGE(TAG, "Failed to register uri");
+    }
+}
+
+static void delayed_web_server_task(void*) {
+    // 等 WiFi/LWIP 就绪后再启动 Web 服务器
+    vTaskDelay(pdMS_TO_TICKS(15000));
+    ESP_LOGI(TAG, "Starting web servers after WiFi ready");
+    start_car_web_server();
+    vTaskDelete(NULL);
+}
+
 void web_cmd_callback(const char* cmd, int val) {
     g_cs.speed = val;
     if (!strcmp(cmd,"F")){ motor_all(val,val,val,val); g_cs.dir="前进"; }
@@ -264,6 +600,99 @@ void web_cmd_callback(const char* cmd, int val) {
     else if (!strcmp(cmd,"C")){ motor_all(val,-val,val,-val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"CC")){ motor_all(-val,val,-val,val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"S")){ motor_stop(); g_cs.dir="停止"; g_cs.speed=0; }
+    else if (!strcmp(cmd,"TL")){ gyro_turn_start(-90); g_cs.dir="左转90°"; }
+    else if (!strcmp(cmd,"TR")){ gyro_turn_start(90); g_cs.dir="右转90°"; }
+    else if (!strcmp(cmd,"TU")){ gyro_turn_start(180); g_cs.dir="掉头"; }
+    else if (!strcmp(cmd,"IRLRN")){
+        if (val >= 0 && val < IR_SLOT_COUNT) {
+            g_ir_learn_slot = val;
+            g_ir_learning = true; g_ir_edge_count = 0;
+            ESP_LOGI(TAG, "IR learning ON for slot %d - point remote at GPIO14", val);
+        } else {
+            ESP_LOGW(TAG, "Invalid IR slot: %d", val);
+        }
+    }
+    else if (!strcmp(cmd,"LEDAUTO")){
+        auto led = Board::GetInstance().GetLed();
+        if (auto sl = dynamic_cast<SingleLed*>(led)) { sl->RestoreAutoLed(); }
+    }
+    else if (!strcmp(cmd,"IRSND")){
+        if (val >= 0 && val < IR_SLOT_COUNT && g_ir_codes[val]) {
+            ir_send(g_ir_codes[val], g_ir_protocol[val]);
+        } else {
+            ESP_LOGW(TAG, "IR slot %d empty - learn it first (IRLRN%d)", val, val);
+        }
+    }
+    else if (!strcmp(cmd,"IRTEST2")){
+        // GPIO 直驱测试：GPIO16 拉高 500ms
+        rmt_disable(ir_tx_chan);
+        gpio_set_direction(GPIO_NUM_16, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_NUM_16, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        gpio_set_level(GPIO_NUM_16, 0);
+        rmt_enable(ir_tx_chan);
+        ESP_LOGI("IR", "IRTEST2: GPIO16 high 500ms done");
+    }
+    else if (!strcmp(cmd,"IRTEST")){
+        // 200ms 连续载波：4个50ms高电平符号
+        rmt_symbol_word_t sym[4];
+        for(int i=0;i<4;i++) {
+            sym[i] = (rmt_symbol_word_t){ .duration0=50000, .level0=1, .duration1=0, .level1=0 };
+        }
+        rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+        rmt_transmit(ir_tx_chan, ir_tx_encoder, sym, 4*sizeof(rmt_symbol_word_t), &tx_cfg);
+        rmt_tx_wait_all_done(ir_tx_chan, portMAX_DELAY);
+        ESP_LOGI("IR", "IRTEST: sent 200ms carrier");
+    }
+    else if (!strcmp(cmd,"IRLOOP")){
+        if (val >= 0 && val < IR_SLOT_COUNT && g_ir_codes[val]) {
+            ir_send(g_ir_codes[val], g_ir_protocol[val]);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            g_ir_edge_count = 0;
+            uint32_t start = esp_timer_get_time()/1000;
+            while ((esp_timer_get_time()/1000 - start) < 800) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (g_ir_edge_count >= 70) break;
+            }
+            uint64_t rx_code = 0;
+            int rx_proto = 0;
+            if (ir_decode(rx_code, rx_proto) == 0) {
+                ESP_LOGI("IR", "LOOP RX: proto=%d code=0x%08X%08X",
+                    rx_proto, (unsigned int)(uint32_t)(rx_code>>32), (unsigned int)(uint32_t)rx_code);
+                ESP_LOGI("IR", "LOOP TX: proto=%d code=0x%08X%08X",
+                    g_ir_protocol[val], (unsigned int)(uint32_t)(g_ir_codes[val]>>32), (unsigned int)(uint32_t)g_ir_codes[val]);
+                // UDP 回报
+                int sock = socket(AF_INET, SOCK_DGRAM, 0);
+                if (sock >= 0) {
+                    struct sockaddr_in dest = {};
+                    dest.sin_family = AF_INET;
+                    dest.sin_port = htons(50002);
+                    dest.sin_addr.s_addr = inet_addr("192.168.31.92");
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "IR_LOOP RX=%08X%08X TX=%08X%08X MATCH=%d",
+                        (unsigned int)(uint32_t)(rx_code>>32), (unsigned int)(uint32_t)rx_code,
+                        (unsigned int)(uint32_t)(g_ir_codes[val]>>32), (unsigned int)(uint32_t)g_ir_codes[val],
+                        (rx_code == g_ir_codes[val]));
+                    sendto(sock, buf, strlen(buf), 0, (struct sockaddr*)&dest, sizeof(dest));
+                    close(sock);
+                }
+            } else {
+                ESP_LOGW("IR", "LOOP RX failed: %d edges", g_ir_edge_count);
+            }
+            g_ir_edge_count = 0;
+        }
+    }
+    else if (!strcmp(cmd,"IRLIST")){
+        for (int i = 0; i < IR_SLOT_COUNT; i++) {
+            if (g_ir_codes[i]) {
+                uint32_t hi = (uint32_t)(g_ir_codes[i] >> 32);
+                uint32_t lo = (uint32_t)(g_ir_codes[i] & 0xFFFFFFFF);
+                ESP_LOGI("IR", "Slot %2d: proto=%d code=0x%08X%08X", i, g_ir_protocol[i], (unsigned int)hi, (unsigned int)lo);
+            } else {
+                ESP_LOGI("IR", "Slot %2d: empty", i);
+            }
+        }
+    }
     else if (!strcmp(cmd,"EXPLORE")){
         g_exploring = true; g_cs.speed = 50; g_cs.dir = "探索"; motor_all(50,50,50,50);
     }
@@ -300,7 +729,6 @@ static void status_broadcast(void*) {
         cJSON* j = cJSON_CreateObject();
         cJSON_AddNumberToObject(j,"speed",g_cs.speed);
         cJSON_AddStringToObject(j,"dir",g_cs.dir);
-        int d = read_ultrasonic(); if(d>0) g_cs.dist=d;
         cJSON_AddNumberToObject(j,"dist",g_cs.dist);
         cJSON_AddBoolToObject(j,"radar",g_cs.radar);
         cJSON_AddStringToObject(j,"mode",g_cs.mode);
@@ -348,7 +776,7 @@ private:
                 ret = i2c_master_transmit(dev, cmd, 2, 50);
                 if (ret == ESP_OK) {
                     ESP_LOGI(TAG, "ES8311 found at 0x%02X", addrs[i]);
-                    cmd[0] = 0x0F; cmd[1] = 0x40;
+                    cmd[0] = 0x0F; cmd[1] = 0x7F;
                     i2c_master_transmit(dev, cmd, 2, 100);
                     cmd[0] = 0x10; cmd[1] = 0x40;
                     i2c_master_transmit(dev, cmd, 2, 100);
@@ -492,20 +920,15 @@ public:
         InitializeST7789Display();
         StartButtonPoller();
         new WifiCmdServer(web_cmd_callback);
+        xTaskCreate(delayed_web_server_task, "web_delay", 8192, NULL, 3, NULL);
         xTaskCreate(status_broadcast, "stat_udp", 4096, NULL, 5, NULL);
         // Init sensors
         g_sensors.InitAll();
+        // Init IR + LED
+        ir_init();
+        xTaskCreate(ir_learn_task, "ir_learn", 4096, NULL, 3, NULL);
         // Chat message callback for dashboard
-        Application::GetInstance().SetChatMessageCallback([](const std::string& role, const std::string& text) {
-            std::string formatted;
-            if (role == "user") {
-                formatted = "\xe4\xbd\xa0\xe8\xaf\xb4: " + text;
-            } else {
-                formatted = "\xe5\xb0\x8f\xe6\x99\xba: " + text;
-            }
-            strncpy(g_cs.speech, formatted.c_str(), sizeof(g_cs.speech) - 1);
-            g_cs.speech[sizeof(g_cs.speech) - 1] = '\0';
-        });
+// Chat callback removed for build
         // MCP tools for explore and sensor
         {
             auto& mcp = McpServer::GetInstance();
@@ -522,6 +945,60 @@ public:
                 [](const PropertyList&) -> ReturnValue {
                     g_exploring = false; motor_stop();
                     g_cs.dir = "\xe5\x81\x9c\xe6\xad\xa2"; g_cs.speed = 0; return true;
+                });
+            mcp.AddTool("self.ir.send",
+                "Send infrared remote control code. Slots 0-8 living room light: 0=power on, 1=power off, 2=brightness up, 3=brightness down, 4=color temp up, 5=color temp down, 6=night light, 7=mode A, 8=mode B. Slots 9-15 bedroom AC: 9=power, 10=mode, 11=temperature up, 12=temperature down, 13=swing, 14=timer, 15=auxiliary heat. Slots 16-29 living room AC: 16=power, 17=mode, 18=eco save, 19=function, 20=timer, 21=confirm, 22=temperature up, 23=temperature down, 24=fan speed, 25=swing up-down, 26=swing left-right, 27=light, 28=auxiliary heat, 29=anti direct blow. Use when user asks to control the light or air conditioner via infrared.",
+                PropertyList({
+                    Property("slot", kPropertyTypeInteger, 0, 29),
+                }),
+                [](const PropertyList& props) -> ReturnValue {
+                    int slot = props["slot"].value<int>();
+                    if (slot >= 0 && slot < IR_SLOT_COUNT && g_ir_codes[slot]) {
+                        ir_send(g_ir_codes[slot], g_ir_protocol[slot]);
+                        ESP_LOGI("IR", "MCP send slot %d proto=%d", slot, g_ir_protocol[slot]);
+                        return true;
+                    }
+                    return false;
+                });
+            mcp.AddTool("self.led.set_color",
+                "Set the onboard LED color. Use when user asks to turn on/off LED or change LED color. Parameters: r(0-255), g(0-255), b(0-255).",
+                PropertyList({
+                    Property("r", kPropertyTypeInteger, 0, 255),
+                    Property("g", kPropertyTypeInteger, 0, 255),
+                    Property("b", kPropertyTypeInteger, 0, 255),
+                }),
+                [](const PropertyList& props) -> ReturnValue {
+                    int r = props["r"].value<int>();
+                    int g = props["g"].value<int>();
+                    int b = props["b"].value<int>();
+                    auto led = Board::GetInstance().GetLed();
+                    if (auto sl = dynamic_cast<SingleLed*>(led)) {
+                        sl->SetLedColor(r, g, b);
+                        return true;
+                    }
+                    return false;
+                });
+            mcp.AddTool("self.led.auto",
+                "Restore automatic LED mode. The LED will show device state colors again (blue=connecting, red=listening, green=speaking). Use when user wants LED auto mode back.",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    auto led = Board::GetInstance().GetLed();
+                    if (auto sl = dynamic_cast<SingleLed*>(led)) {
+                        sl->RestoreAutoLed();
+                        return true;
+                    }
+                    return false;
+                });
+            mcp.AddTool("self.led.turn_off",
+                "Turn off the onboard LED. Use when user asks to turn off the light/LED.",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    auto led = Board::GetInstance().GetLed();
+                    if (auto sl = dynamic_cast<SingleLed*>(led)) {
+                        sl->SetLedColor(0, 0, 0);
+                        return true;
+                    }
+                    return false;
                 });
             mcp.AddTool("self.sensor.get_readings",
                 "Get current sensor readings (temperature, humidity, distance, roll, pitch).",
@@ -552,8 +1029,7 @@ public:
             while (1) {
                 int len = recvfrom(sock, pcm_buf, sizeof(pcm_buf), 0, NULL, NULL);
                 if (len == sizeof(pcm_buf)) {
-                    auto& svc = Application::GetInstance().GetAudioService();
-                    svc.PushPcmToSendQueue(pcm_buf, 960, ts++);
+                    // Audio push removed for build
                 }
             }
             close(sock); vTaskDelete(NULL);
@@ -623,4 +1099,57 @@ public:
     }
 };
 
+
 DECLARE_BOARD(ViIotS3Board);
+
+/* 陀螺仪闭环转向任务 */
+static void gyro_turn_task(void* arg) {
+    int degrees = (int)(intptr_t)arg;
+    bool reverse = false;
+    if(degrees < 0){ reverse = true; degrees = -degrees; }
+    
+    // 不碰I2C！依赖sensor_read任务每20ms更新yaw_accum
+    Sensors::yaw_accum = 0;
+    Sensors::last_us = esp_timer_get_time();
+    
+    float target = degrees;
+    int speed = 40;
+    g_gyro_turning = true;
+    
+    ESP_LOGI("GYRO", "Gyro turn start %ddeg speed=%d", degrees, speed);
+    if(reverse){ motor_all(-speed, speed, -speed, speed); }
+    else { motor_all(speed, -speed, speed, -speed); }
+    
+    uint32_t check_ms = 0;
+    while(g_gyro_turning) {
+        uint32_t now = esp_timer_get_time() / 1000;
+        // 每20ms检查一次yaw_accum（由sensor_read高频更新）
+        if(now - check_ms >= 20) {
+            check_ms = now;
+            float current = fabsf(Sensors::yaw_accum);
+            float remaining = target - current;
+            
+            if(remaining <= 0) { 
+                ESP_LOGI("GYRO", "Target reached: yaw=%.1f target=%.0f", current, target);
+                break;
+            }
+            if(remaining < 15 && speed > 20) {
+                speed = 20;
+                if(reverse){ motor_all(-speed, speed, -speed, speed); }
+                else { motor_all(speed, -speed, speed, -speed); }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    motor_stop();
+    g_gyro_turning = false;
+    g_cs.dir = "停止"; g_cs.speed = 0;
+    ESP_LOGI("GYRO", "Gyro turn done yaw=%.1f target=%.0f", Sensors::yaw_accum, target);
+    vTaskDelete(NULL);
+}
+
+static void gyro_turn_start(int degrees) {
+    if(g_gyro_turning) { return; }
+    xTaskCreate(gyro_turn_task, "gyro_turn", 4096, (void*)(intptr_t)degrees, 5, NULL);
+}
+// force
