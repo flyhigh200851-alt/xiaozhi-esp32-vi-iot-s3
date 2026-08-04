@@ -206,6 +206,62 @@ Sensors g_sensors;
 SensorData g_sd;
 bool g_exploring = false;
 
+/* ─── Babycare 直连警示：ALERT1 闪灯 -> 超时探索；ALERT0 全部停止 ─── */
+static bool g_alert_active = false;
+static uint32_t g_alert_epoch = 0;
+#define ALERT_TIMEOUT_SEC 60
+#define ALERT_PATROL_SEC 300
+
+static void alert_flash_task(void* arg) {
+    uint32_t epoch = (uint32_t)(uintptr_t)arg;
+    auto* led = Board::GetInstance().GetLed();
+    auto* sl = dynamic_cast<SingleLed*>(led);
+    while (g_alert_active && g_alert_epoch == epoch) {
+        if (sl) sl->SetLedColor(255, 30, 0);
+        vTaskDelay(pdMS_TO_TICKS(350));
+        if (!g_alert_active || g_alert_epoch != epoch) break;
+        if (sl) sl->SetLedColor(60, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+    if (sl) sl->RestoreAutoLed();
+    vTaskDelete(NULL);
+}
+
+static void alert_timeout_task(void* arg) {
+    uint32_t epoch = (uint32_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(ALERT_TIMEOUT_SEC * 1000));
+    if (g_alert_active && g_alert_epoch == epoch) {
+        ESP_LOGI(TAG, "Alert timeout: search mode");
+        g_exploring = true; g_cs.speed = 50; g_cs.dir = "找人"; motor_all(50, 50, 50, 50);
+        vTaskDelay(pdMS_TO_TICKS(ALERT_PATROL_SEC * 1000));
+        if (g_alert_active && g_alert_epoch == epoch) {
+            ESP_LOGI(TAG, "Alert patrol cap: stop moving, LED keeps flashing");
+            g_exploring = false; motor_stop(); g_cs.speed = 0; g_cs.dir = "警示";
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+static void car_alert_stop() {
+    g_alert_active = false;
+    ++g_alert_epoch;
+    g_exploring = false;
+    motor_stop(); g_cs.speed = 0; g_cs.dir = "停止";
+    auto* led = Board::GetInstance().GetLed();
+    if (auto* sl = dynamic_cast<SingleLed*>(led)) sl->RestoreAutoLed();
+    ESP_LOGI(TAG, "ALERT stop: LED off, motors stopped");
+}
+
+static void car_alert_start() {
+    car_alert_stop();
+    uint32_t epoch = ++g_alert_epoch;
+    g_alert_active = true;
+    g_cs.speed = 0; g_cs.dir = "警示";
+    xTaskCreate(alert_flash_task, "alert_flash", 3072, (void*)(uintptr_t)epoch, 3, NULL);
+    xTaskCreate(alert_timeout_task, "alert_to", 3072, (void*)(uintptr_t)epoch, 3, NULL);
+    ESP_LOGI(TAG, "ALERT start: LED flashing, timeout=%ds", ALERT_TIMEOUT_SEC);
+}
+
 static void motor_notify(const char* status, int fl, int fr, int rl, int rr) {
     g_cs.dir = status;
     motor_all(fl, fr, rl, rr);
@@ -484,6 +540,7 @@ h1{font-size:20px;margin-bottom:8px;color:#58a6ff}
 .row button{flex:1;background:#21262d;border:none;color:#e6edf3;padding:10px;border-radius:8px;cursor:pointer;font-size:13px}
 .row button:active{background:#30363d}
 .row button.g{background:#0e4429}.row button.r{background:#581010}
+.row button.a{background:#5a4a00}
 #wsd,#up{text-align:center;font-size:11px;color:#8b949e;margin-bottom:8px}
 </style></head><body>
 <h1>&#x1F697; 小智小车</h1>
@@ -500,7 +557,7 @@ h1{font-size:20px;margin-bottom:8px;color:#58a6ff}
 <button class="mv" data-cmd="self.motor.turn_left" data-args='{"speed":45,"duration":5}'>&#x2B05;</button><button class="s" onclick="c('self.motor.stop','{}')">&#x23F9;</button><button class="mv" data-cmd="self.motor.turn_right" data-args='{"speed":45,"duration":5}'>&#x27A1;</button>
 <div></div><button class="mv" data-cmd="self.motor.backward" data-args='{"speed":60,"duration":5}'>&#x2B07;</button><div></div>
 </div>
-<div class="row"><button class="g" onclick="c('self.motor.explore','{}')">探索</button><button class="r" onclick="c('self.motor.stop_explore','{}')">停止</button></div>
+<div class="row"><button class="g" onclick="c('self.motor.explore','{}')">探索</button><button class="r" onclick="c('self.motor.stop_explore','{}')">停止</button><button class="a" onclick="c('self.alert.stop','{}')">解除警示</button></div>
 <script>
 var ws=null,reT=null,holdTimer=null;
 var d=document.getElementById('wsd');
@@ -554,7 +611,7 @@ setInterval(function(){
   document.getElementById('ds').textContent=(s.dist&&s.dist<2000?s.dist+'mm':'--');
   document.getElementById('up').textContent=fmtUp(s.uptime);
  }).catch(function(){});
-},1000);
+},2000);
 </script></body></html>
 )HTML";
 
@@ -698,6 +755,10 @@ void web_cmd_callback(const char* cmd, int val) {
     }
     else if (!strcmp(cmd,"STOPEXP")){
         g_exploring = false; motor_stop(); g_cs.dir = "停止"; g_cs.speed = 0;
+    }
+    else if (!strcmp(cmd,"ALERT")){
+        if (val == 1) car_alert_start();
+        else car_alert_stop();
     }
     else if (!strcmp(cmd,"LISTEN")){
         ESP_LOGI(TAG, "Activate conversation via dashboard");
@@ -999,6 +1060,20 @@ public:
                         return true;
                     }
                     return false;
+                });
+            mcp.AddTool("self.alert.stop",
+                "Stop the baby alert: stop patrolling, turn off the flashing LED and restore normal LED mode. Call when the user says they have arrived or the baby is fine, e.g. '我来了', '宝宝没事了', '不用巡逻了', stop the alert, dismiss the alarm.",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    car_alert_stop();
+                    return true;
+                });
+            mcp.AddTool("self.alert.start",
+                "Start the baby alert for testing: flash the LED and after a timeout patrol the room.",
+                PropertyList(),
+                [](const PropertyList&) -> ReturnValue {
+                    car_alert_start();
+                    return true;
                 });
             mcp.AddTool("self.sensor.get_readings",
                 "Get current sensor readings (temperature, humidity, distance, roll, pitch).",

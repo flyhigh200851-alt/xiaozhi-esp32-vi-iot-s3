@@ -92,7 +92,8 @@ bool WebSocketControlServer::Start(int port) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
-    config.max_open_sockets = 7;
+    config.max_open_sockets = 16;
+    config.lru_purge_enable = true;
     config.ctrl_port = 32769;
 
     httpd_uri_t ws_uri = {
@@ -181,14 +182,14 @@ void WebSocketControlServer::AddClient(httpd_req_t* req) {
     int sock_fd = httpd_req_to_sockfd(req);
     if (clients_.find(sock_fd) == clients_.end()) {
         clients_[sock_fd] = req;
-        ESP_LOGI(TAG, "WebSocket client connected: %d (total: %zu)", sock_fd, clients_.size());
+        ESP_LOGI(TAG, "WebSocket client connected: %d (total: %d)", sock_fd, (int)clients_.size());
     }
 }
 
 void WebSocketControlServer::RemoveClient(httpd_req_t* req) {
     int sock_fd = httpd_req_to_sockfd(req);
     clients_.erase(sock_fd);
-    ESP_LOGI(TAG, "WebSocket client disconnected: %d (total: %zu)", sock_fd, clients_.size());
+    ESP_LOGI(TAG, "WebSocket client disconnected: %d (total: %d)", sock_fd, (int)clients_.size());
 }
 
 size_t WebSocketControlServer::GetClientCount() const {
