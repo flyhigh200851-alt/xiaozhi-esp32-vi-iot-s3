@@ -515,9 +515,9 @@ static esp_err_t car_cmd_handler(httpd_req_t* req) {
 static esp_err_t car_status_handler(httpd_req_t* req) {
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"speed\":%d,\"temp\":%.1f,\"hum\":%.0f,\"dist\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"uptime\":%lld}",
+        "{\"speed\":%d,\"temp\":%.1f,\"hum\":%.0f,\"dist\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"uptime\":%lu}",
         g_cs.speed, g_sd.temp, g_sd.hum, g_sd.dist, g_sd.roll, g_sd.pitch,
-        (long long)(esp_timer_get_time() / 1000000));
+        (unsigned long)(esp_timer_get_time() / 1000000));
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
 }
@@ -630,7 +630,8 @@ static void start_car_web_server() {
     }
     httpd_uri_t s = {"/api/status", HTTP_GET, car_status_handler, NULL};
     httpd_uri_t root = {"/", HTTP_GET, car_root_handler, NULL};
-    bool ok = (ws_server.RegisterUri(&s) == ESP_OK) && (ws_server.RegisterUri(&root) == ESP_OK);
+    httpd_uri_t cmd = {"/api/command", HTTP_GET, car_cmd_handler, NULL};
+    bool ok = (ws_server.RegisterUri(&s) == ESP_OK) && (ws_server.RegisterUri(&root) == ESP_OK) && (ws_server.RegisterUri(&cmd) == ESP_OK);
     if (ok) {
         ESP_LOGI(TAG, "Web: http://192.168.31.142:8080/  ws://192.168.31.142:8080/ws");
     } else {
