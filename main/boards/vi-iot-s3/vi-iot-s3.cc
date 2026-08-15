@@ -206,6 +206,18 @@ Sensors g_sensors;
 SensorData g_sd;
 bool g_exploring = false;
 
+/* 结构化巡逻状态 */
+static bool g_patrol_running = false;
+static bool g_patrol_stop = false;
+static float g_patrol_straight_yaw = 0;
+static uint32_t g_patrol_side_start_ms = 0;
+static int g_patrol_side_index = 0;
+static int g_patrol_loop_index = 0;
+static int g_patrol_side_ms = 1500;
+static int g_patrol_speed = 50;
+static int g_patrol_direction = 1;
+static int g_patrol_loops = 1;
+
 /* ─── Babycare 直连警示：ALERT1 闪灯 -> 超时探索；ALERT0 全部停止 ─── */
 static bool g_alert_active = false;
 static uint32_t g_alert_epoch = 0;
@@ -303,6 +315,8 @@ static void RunMotorTestTask(void* param) {
 static volatile bool g_gyro_turning = false;
 static void gyro_turn_task(void* arg);
 static void gyro_turn_start(int degrees);
+static void patrol_start(int side_cm, int loops, int direction, int speed);
+static void patrol_stop();
 
 /* ============ 红外发射 + 红外学习 ============ */
 #define IR_TX_GPIO   GPIO_NUM_16
@@ -515,8 +529,8 @@ static esp_err_t car_cmd_handler(httpd_req_t* req) {
 static esp_err_t car_status_handler(httpd_req_t* req) {
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "{\"speed\":%d,\"temp\":%.1f,\"hum\":%.0f,\"dist\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"uptime\":%lu}",
-        g_cs.speed, g_sd.temp, g_sd.hum, g_sd.dist, g_sd.roll, g_sd.pitch,
+        "{\"speed\":%d,\"temp\":%.1f,\"hum\":%.0f,\"dist\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f,\"mpu\":%d,\"uptime\":%lu}",
+        g_cs.speed, g_sd.temp, g_sd.hum, g_sd.dist, g_sd.roll, g_sd.pitch, g_sd.yaw, g_sd.mpu_ok ? 1 : 0,
         (unsigned long)(esp_timer_get_time() / 1000000));
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
@@ -752,10 +766,10 @@ void web_cmd_callback(const char* cmd, int val) {
         }
     }
     else if (!strcmp(cmd,"EXPLORE")){
-        g_exploring = true; g_cs.speed = 50; g_cs.dir = "探索"; motor_all(50,50,50,50);
+        patrol_start(60, 9999, 1, 50);
     }
     else if (!strcmp(cmd,"STOPEXP")){
-        g_exploring = false; motor_stop(); g_cs.dir = "停止"; g_cs.speed = 0;
+        patrol_stop();
     }
     else if (!strcmp(cmd,"ALERT")){
         if (val == 1) car_alert_start();
@@ -778,6 +792,11 @@ void web_cmd_callback(const char* cmd, int val) {
             esp_restart();
         }
     }
+    else if (!strcmp(cmd,"RECT")){
+        if (val <= 0) val = 60;
+        patrol_start(val, 1, 1, 50);
+        ESP_LOGI(TAG, "RECT start side=%dcm", val);
+    }
     else if (!strcmp(cmd,"T")){ motor_test(); }
 }
 
@@ -793,6 +812,10 @@ static void status_broadcast(void*) {
         cJSON_AddStringToObject(j,"dir",g_cs.dir);
         cJSON_AddNumberToObject(j,"dist",g_cs.dist);
         cJSON_AddBoolToObject(j,"radar",g_cs.radar);
+        cJSON_AddNumberToObject(j,"roll",g_sd.roll);
+        cJSON_AddNumberToObject(j,"pitch",g_sd.pitch);
+        cJSON_AddNumberToObject(j,"yaw",Sensors::yaw_accum);
+        cJSON_AddBoolToObject(j,"mpu",g_sd.mpu_ok);
         cJSON_AddStringToObject(j,"mode",g_cs.mode);
         cJSON_AddStringToObject(j,"model",g_cs.model);
         cJSON_AddStringToObject(j,"speech",g_cs.speech);
@@ -984,8 +1007,6 @@ public:
         new WifiCmdServer(web_cmd_callback);
         xTaskCreate(delayed_web_server_task, "web_delay", 8192, NULL, 3, NULL);
         xTaskCreate(status_broadcast, "stat_udp", 4096, NULL, 5, NULL);
-        // Init sensors
-        g_sensors.InitAll();
         // Init IR + LED
         ir_init();
         xTaskCreate(ir_learn_task, "ir_learn", 4096, NULL, 3, NULL);
@@ -995,18 +1016,48 @@ public:
         {
             auto& mcp = McpServer::GetInstance();
             mcp.AddTool("self.motor.explore",
-                "Start autonomous exploration mode. The car drives forward and avoids obstacles.",
+                "Start structured rectangle patrol: drive a rectangle loop, keep straight with the gyroscope, and scan left/right with gyro turns when hitting an obstacle. "
+                "Stop with self.motor.stop_explore.",
                 PropertyList(),
                 [](const PropertyList&) -> ReturnValue {
-                    g_exploring = true; g_cs.speed = 50; g_cs.dir = "\xe6\x8e\xa2\xe7\xb4\xa2";
-                    motor_all(50,50,50,50); return true;
+                    patrol_start(60, 9999, 1, 50); return true;
                 });
             mcp.AddTool("self.motor.stop_explore",
                 "Stop exploration mode and stop the car.",
                 PropertyList(),
                 [](const PropertyList&) -> ReturnValue {
-                    g_exploring = false; motor_stop();
-                    g_cs.dir = "\xe5\x81\x9c\xe6\xad\xa2"; g_cs.speed = 0; return true;
+                    patrol_stop(); return true;
+                });
+            mcp.AddTool("self.motor.turn_degrees",
+                "Precise gyro turn by a specific number of degrees. Use when the user asks to turn 90/180 degrees, 掉头, turn around, or gives an exact angle. "
+                "direction=1 turns right (clockwise), direction=-1 turns left.",
+                PropertyList({
+                    Property("degrees", kPropertyTypeInteger, 90, 1, 360),
+                    Property("direction", kPropertyTypeInteger, 1, -1, 1),
+                }),
+                [](const PropertyList& props) -> ReturnValue {
+                    int deg = props["degrees"].value<int>();
+                    int dir = props["direction"].value<int>();
+                    gyro_turn_start(dir > 0 ? deg : -deg);
+                    return true;
+                });
+            mcp.AddTool("self.motor.drive_rectangle",
+                "Drive around a rectangle loop instead of spinning in place. Use when the user asks 转圈, 绕圈, 绕着转, 按矩形转圈, or drive a 60cm circle. "
+                "Each loop drives 4 straight sides with gyro 90-degree corner turns, keeps straight with the gyroscope, and avoids obstacles. "
+                "side_cm is one side length, default 60cm.",
+                PropertyList({
+                    Property("side_cm", kPropertyTypeInteger, 60, 20, 500),
+                    Property("loops", kPropertyTypeInteger, 1, 1, 10),
+                    Property("direction", kPropertyTypeInteger, 1, -1, 1),
+                    Property("speed", kPropertyTypeInteger, 50, 20, 80),
+                }),
+                [](const PropertyList& props) -> ReturnValue {
+                    int side = props["side_cm"].value<int>();
+                    int loops = props["loops"].value<int>();
+                    int dir = props["direction"].value<int>();
+                    int speed = props["speed"].value<int>();
+                    patrol_start(side, loops, dir, speed);
+                    return true;
                 });
             mcp.AddTool("self.ir.send",
                 "Send infrared remote control code. Slots 0-8 living room light: 0=power on, 1=power off, 2=brightness up, 3=brightness down, 4=color temp up, 5=color temp down, 6=night light, 7=mode A, 8=mode B. Slots 9-15 bedroom AC: 9=power, 10=mode, 11=temperature up, 12=temperature down, 13=swing, 14=timer, 15=auxiliary heat. Slots 16-29 living room AC: 16=power, 17=mode, 18=eco save, 19=function, 20=timer, 21=confirm, 22=temperature up, 23=temperature down, 24=fan speed, 25=swing up-down, 26=swing left-right, 27=light, 28=auxiliary heat, 29=anti direct blow. Use when user asks to control the light or air conditioner via infrared.",
@@ -1110,48 +1161,39 @@ public:
             }
             close(sock); vTaskDelete(NULL);
         }, "audio_udp", 4096, NULL, 4, NULL);
-        // Sensor read + exploration task
+        // Sensor read + exploration task: AHT/VL53 每 500ms 一次
         xTaskCreate([](void*) {
             vTaskDelay(pdMS_TO_TICKS(3000));
-            uint32_t last_wander = 0;
+            uint32_t last_slow_ms = 0;
             while (1) {
-                g_sd = g_sensors.ReadAll();
                 uint32_t now = esp_timer_get_time() / 1000;
-                if(g_cs.speed > 0 && g_sd.dist_ok){
-                    uint16_t d = g_sd.dist;
-                    if(g_exploring){
-                        if(d > 0 && d < 350){
-                            ESP_LOGI(TAG, "DANGER avoid %dmm", d);
-                            motor_stop(); g_cs.speed = 0;
-                            vTaskDelay(pdMS_TO_TICKS(80));
-                            motor_all(-45,-45,-45,-45); vTaskDelay(pdMS_TO_TICKS(500)); motor_stop();
-                            if(rand()%2){ motor_all(40,-40,40,-40); }
-                            else { motor_all(-40,40,-40,40); }
-                            vTaskDelay(pdMS_TO_TICKS(500 + rand()%700)); motor_stop();
-                            motor_all(50,50,50,50); g_cs.speed = 50;
-                        } else if(d >= 350 && d < 600){
-                            if(g_cs.speed > 25){ motor_all(25,25,25,25); g_cs.speed = 25; ESP_LOGI(TAG, "SLOW %dmm", d); }
-                        } else if(d >= 600 && d < 900){
-                            if(g_cs.speed > 40){ motor_all(35,35,35,35); g_cs.speed = 35; }
-                        } else {
-                            if(g_cs.speed < 50){ motor_all(50,50,50,50); g_cs.speed = 50; }
-                        }
-                        if(now - last_wander > 8000 + (rand()%5000)){
-                            last_wander = now;
-                            int t = 200 + rand()%600;
-                            if(rand()%2){ motor_all(40,-40,40,-40); }
-                            else { motor_all(-40,40,-40,40); }
-                            vTaskDelay(pdMS_TO_TICKS(t)); motor_stop();
-                            motor_all(50,50,50,50); g_cs.speed = 50;
-                            ESP_LOGI(TAG, "WANDER %dms", t);
-                        }
-                    } else {
-                        if(d > 0 && d < 200){ motor_stop(); g_cs.speed = 0; ESP_LOGI(TAG, "AUTO-STOP %dmm", d); }
-                    }
+                if (now - last_slow_ms >= 500) {
+                    last_slow_ms = now;
+                    SensorData slow = g_sensors.ReadSlowSensors();
+                    g_sd.temp = slow.temp; g_sd.hum = slow.hum; g_sd.ok = slow.ok;
+                    g_sd.dist = slow.dist; g_sd.dist_ok = slow.dist_ok;
+                    g_cs.dist = slow.dist_ok ? slow.dist : -1;
                 }
-                vTaskDelay(pdMS_TO_TICKS(200));
+                if(!g_exploring && g_cs.speed > 0 && g_sd.dist_ok){
+                    uint16_t d = g_sd.dist;
+                    if(d > 0 && d < 200){ motor_stop(); g_cs.speed = 0; ESP_LOGI(TAG, "AUTO-STOP %dmm", d); }
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
-        }, "sensor_read", 4096, NULL, 4, NULL);
+        }, "sensor_read", 8192, NULL, 4, NULL);
+        // MPU 高频采样任务：与 AHT/VL53 通过 I2C 互斥锁隔离
+        xTaskCreate([](void*) {
+            vTaskDelay(pdMS_TO_TICKS(3500));
+            float roll=0, pitch=0, yaw=0;
+            while (1) {
+                if (g_sensors.ReadMPU6050(roll, pitch, yaw)) {
+                    g_sd.roll = roll; g_sd.pitch = pitch; g_sd.yaw = yaw; g_sd.mpu_ok = true;
+                } else {
+                    g_sd.mpu_ok = false;
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }, "mpu_read", 4096, NULL, 5, NULL);
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -1183,39 +1225,46 @@ static void gyro_turn_task(void* arg) {
     int degrees = (int)(intptr_t)arg;
     bool reverse = false;
     if(degrees < 0){ reverse = true; degrees = -degrees; }
-    
-    // 不碰I2C！依赖sensor_read任务每20ms更新yaw_accum
+
     Sensors::yaw_accum = 0;
     Sensors::last_us = esp_timer_get_time();
-    
+
     float target = degrees;
-    int speed = 40;
+    int speed = 60;
     g_gyro_turning = true;
-    
+    uint64_t start_us = esp_timer_get_time();
+
     ESP_LOGI("GYRO", "Gyro turn start %ddeg speed=%d", degrees, speed);
     if(reverse){ motor_all(-speed, speed, -speed, speed); }
     else { motor_all(speed, -speed, speed, -speed); }
-    
+
     uint32_t check_ms = 0;
     while(g_gyro_turning) {
         uint32_t now = esp_timer_get_time() / 1000;
-        // 每20ms检查一次yaw_accum（由sensor_read高频更新）
         if(now - check_ms >= 20) {
             check_ms = now;
             float current = fabsf(Sensors::yaw_accum);
             float remaining = target - current;
-            
-            if(remaining <= 0) { 
+
+            uint64_t last_read = Sensors::mpu_last_read_us;
+            bool stale = (last_read == 0) || ((esp_timer_get_time() - last_read) > 1000000ULL);
+            uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+            if(stale || elapsed_ms > 12000) {
+                ESP_LOGW("GYRO", "Abort: stale=%d elapsed=%ums yaw=%.1f", stale, elapsed_ms, current);
+                break;
+            }
+
+            if(remaining <= 0) {
                 ESP_LOGI("GYRO", "Target reached: yaw=%.1f target=%.0f", current, target);
                 break;
             }
-            if(remaining < 15 && speed > 20) {
-                speed = 20;
+            if(remaining < 15 && speed > 30) {
+                speed = 25;
                 if(reverse){ motor_all(-speed, speed, -speed, speed); }
                 else { motor_all(speed, -speed, speed, -speed); }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     motor_stop();
     g_gyro_turning = false;
@@ -1228,4 +1277,172 @@ static void gyro_turn_start(int degrees) {
     if(g_gyro_turning) { return; }
     xTaskCreate(gyro_turn_task, "gyro_turn", 4096, (void*)(intptr_t)degrees, 5, NULL);
 }
-// force
+
+/* 结构化巡逻：矩形路径 + 陀螺仪直线纠偏 + 左右扫描避障 */
+#define RECT_SPEED_CM_PER_SEC 40.0f
+
+static bool wait_gyro_done(uint32_t timeout_ms) {
+    uint32_t start = esp_timer_get_time() / 1000;
+    while (g_gyro_turning && !g_patrol_stop && (esp_timer_get_time() / 1000 - start) < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return !g_gyro_turning;
+}
+
+static int read_vl53_mm() {
+    uint16_t d = 0;
+    return g_sensors.ReadVL53L0X(d) ? (int)d : -1;
+}
+
+static void patrol_forward_start() {
+    g_patrol_straight_yaw = Sensors::yaw_accum;
+    g_patrol_side_start_ms = esp_timer_get_time() / 1000;
+    g_cs.dir = "巡逻直行";
+    g_cs.speed = g_patrol_speed;
+    motor_all(g_patrol_speed, g_patrol_speed, g_patrol_speed, g_patrol_speed);
+}
+
+static void patrol_apply_straight_correction() {
+    if (g_cs.speed <= 0 || !g_sd.mpu_ok) return;
+    float drift = Sensors::yaw_accum - g_patrol_straight_yaw;
+    if (drift > 180.0f) drift -= 360.0f;
+    if (drift < -180.0f) drift += 360.0f;
+    int corr = (int)(drift * 0.8f);
+    if (corr > 12) corr = 12;
+    if (corr < -12) corr = -12;
+    if (corr == 0) return;
+    /* 实机观测：顺时针 yaw 为负，偏右时左轮降速、右轮提速 */
+    int left = g_patrol_speed + corr;
+    int right = g_patrol_speed - corr;
+    motor_all(left, right, left, right);
+}
+
+static void patrol_avoid_obstacle() {
+    motor_stop();
+    g_cs.speed = 0;
+    g_cs.dir = "避障扫描";
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    gyro_turn_start(90);
+    wait_gyro_done(15000);
+    if (g_patrol_stop) return;
+    int right = read_vl53_mm();
+
+    gyro_turn_start(-180);
+    wait_gyro_done(15000);
+    if (g_patrol_stop) return;
+    int left = read_vl53_mm();
+
+    gyro_turn_start(90);
+    wait_gyro_done(15000);
+    if (g_patrol_stop) return;
+
+    int turn = 90;
+    if (left > right) turn = -90;
+    if (left < 0 && right < 0) turn = (rand() % 2) ? 90 : -90;
+    ESP_LOGI(TAG, "AVOID left=%d right=%d turn=%d", left, right, turn);
+
+    g_cs.dir = "避障转弯";
+    gyro_turn_start(turn);
+    wait_gyro_done(15000);
+    if (g_patrol_stop) return;
+
+    g_cs.dir = "避障绕行";
+    g_cs.speed = 40;
+    motor_all(40, 40, 40, 40);
+    uint32_t detour_start = esp_timer_get_time() / 1000;
+    while (!g_patrol_stop && (esp_timer_get_time() / 1000 - detour_start) < 700) {
+        uint16_t d = 0;
+        bool ok = g_sensors.ReadVL53L0X(d);
+        if (ok && d > 0 && d < 350) break;
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    motor_stop();
+    g_cs.speed = 0;
+
+    gyro_turn_start(-turn);
+    wait_gyro_done(15000);
+}
+
+static void patrol_task(void* arg) {
+    g_patrol_stop = false;
+    g_patrol_running = true;
+    g_patrol_side_index = 0;
+    g_patrol_loop_index = 0;
+    ESP_LOGI(TAG, "Patrol start side=%dms loops=%d speed=%d", g_patrol_side_ms, g_patrol_loops, g_patrol_speed);
+
+    while (g_patrol_running && !g_patrol_stop && g_patrol_loop_index < g_patrol_loops) {
+        patrol_forward_start();
+        bool side_done = false;
+        while (g_patrol_running && !g_patrol_stop && !side_done) {
+            patrol_apply_straight_correction();
+
+            uint16_t d = 0;
+            bool ok = g_sensors.ReadVL53L0X(d);
+            uint32_t now = esp_timer_get_time() / 1000;
+            if (ok && d > 0 && d < 350) {
+                ESP_LOGI(TAG, "Patrol obstacle %dmm", d);
+                patrol_avoid_obstacle();
+                g_patrol_side_start_ms = esp_timer_get_time() / 1000;
+                side_done = true;
+                break;
+            }
+            if (now - g_patrol_side_start_ms >= (uint32_t)g_patrol_side_ms) {
+                motor_stop();
+                g_cs.speed = 0;
+                g_cs.dir = "巡逻转弯";
+                gyro_turn_start(g_patrol_direction > 0 ? 90 : -90);
+                wait_gyro_done(15000);
+                g_patrol_side_index++;
+                if (g_patrol_side_index >= 4) {
+                    g_patrol_side_index = 0;
+                    g_patrol_loop_index++;
+                    ESP_LOGI(TAG, "Patrol loop %d done", g_patrol_loop_index);
+                }
+                side_done = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+    }
+
+    motor_stop();
+    g_cs.speed = 0;
+    g_cs.dir = "停止";
+    g_patrol_running = false;
+    g_exploring = false;
+    ESP_LOGI(TAG, "Patrol finished");
+    vTaskDelete(NULL);
+}
+
+static void patrol_start(int side_cm, int loops, int direction, int speed) {
+    if (side_cm < 20) side_cm = 20;
+    if (side_cm > 500) side_cm = 500;
+    if (loops < 1) loops = 1;
+    if (loops > 10000) loops = 10000;
+    if (speed < 20) speed = 20;
+    if (speed > 80) speed = 80;
+
+    if (g_patrol_running) {
+        g_patrol_stop = true;
+        uint32_t wait = esp_timer_get_time() / 1000;
+        while (g_patrol_running && (esp_timer_get_time() / 1000 - wait) < 3000) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    g_patrol_side_ms = (int)(side_cm / RECT_SPEED_CM_PER_SEC * 1000.0f);
+    g_patrol_speed = speed;
+    g_patrol_direction = direction;
+    g_patrol_loops = loops;
+    g_exploring = true;
+    xTaskCreate(patrol_task, "patrol", 8192, NULL, 5, NULL);
+}
+
+static void patrol_stop() {
+    g_patrol_stop = true;
+    motor_stop();
+    g_cs.speed = 0;
+    g_cs.dir = "停止";
+    g_exploring = false;
+}

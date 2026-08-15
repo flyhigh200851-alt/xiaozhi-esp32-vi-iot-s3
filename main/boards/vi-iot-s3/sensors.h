@@ -5,6 +5,8 @@
 #include <math.h>
 #include <esp_timer.h>
 #include "rom/ets_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define SDA_GPIO  GPIO_NUM_12
 #define SCL_GPIO  GPIO_NUM_13
@@ -24,6 +26,18 @@ public:
     bool aht20_ok=false, vl53_ok=false, mpu_ok=false;
     static float yaw_accum;
     static uint64_t last_us;
+    static float gz_bias;
+    static uint64_t mpu_last_read_us;
+    static SemaphoreHandle_t i2c_mutex;
+
+    struct I2cLock {
+        SemaphoreHandle_t mtx;
+        bool ok;
+        I2cLock(SemaphoreHandle_t m) : mtx(m) {
+            ok = (mtx != nullptr) && (xSemaphoreTake(mtx, pdMS_TO_TICKS(1500)) == pdTRUE);
+        }
+        ~I2cLock(){ if(ok && mtx){ xSemaphoreGive(mtx); } }
+    };
 
     void sw_init() {
         gpio_set_direction(SDA_GPIO, GPIO_MODE_INPUT_OUTPUT_OD);
@@ -32,7 +46,7 @@ public:
         gpio_set_pull_mode(SCL_GPIO, GPIO_PULLUP_ONLY);
         gpio_set_level(SDA_GPIO,1); gpio_set_level(SCL_GPIO,1); ets_delay_us(20);
     }
-    void sw_delay() { ets_delay_us(100); }
+    void sw_delay() { ets_delay_us(10); }
     void sw_start() {
         gpio_set_level(SDA_GPIO,1);sw_delay();gpio_set_level(SCL_GPIO,1);sw_delay();
         gpio_set_level(SDA_GPIO,0);sw_delay();gpio_set_level(SCL_GPIO,0);sw_delay();
@@ -115,6 +129,8 @@ public:
         aht20_ok=true;ESP_LOGI("SENS","AHT20 ready");return true;
     }
     bool ReadAHT20(float& t,float& h){
+        I2cLock lock(i2c_mutex);
+        if(!lock.ok) return false;
         uint8_t trig[]={0xAC,0x33,0x00};
         if(!sw_write_bytes(AHT20_ADDR,trig,3)){ESP_LOGE("AHT","trig write fail");return false;}
         vTaskDelay(pdMS_TO_TICKS(150));
@@ -154,6 +170,8 @@ public:
         return vl53_ok;
     }
     bool ReadVL53L0X(uint16_t& dist){
+        I2cLock lock(i2c_mutex);
+        if(!lock.ok) return false;
         for(int k=0;k<3;k++){
             sw_write_bytes(VL53_ADDR,(uint8_t[]){0x00,1},2);
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -170,19 +188,49 @@ public:
         return false;
     }
 
+    bool CalibrateGyro(){
+        const int N=64;
+        float sum=0; int n=0;
+        for(int i=0;i<N;i++){
+            uint8_t r[14];
+            if(sw_read_bytes(MPU_ADDR,0x3B,r,14)){
+                int16_t gz=(r[12]<<8)|r[13];
+                sum += gz; n++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if(n < 32){ ESP_LOGE("MPU","calibrate failed, samples=%d", n); return false; }
+        gz_bias = sum / n;
+        return true;
+    }
+
     bool InitMPU6050(){
-        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x6B,0},2);vTaskDelay(pdMS_TO_TICKS(50));
-        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x19,0x07},2);  // Sample rate divider 125Hz
-        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x1A,0x06},2);  // Low pass filter 5Hz
+        uint8_t id=0;
+        if(!sw_read_bytes(MPU_ADDR,0x75,&id,1) || ((id & 0x7E) != 0x68 && (id & 0x7E) != 0x70)){
+            ESP_LOGE("MPU","WHO_AM_I mismatch: 0x%02X", id);
+            mpu_ok=false; return false;
+        }
+        ESP_LOGI("MPU","WHO_AM_I=0x%02X", id);
+        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x6B,0},2);vTaskDelay(pdMS_TO_TICKS(10));
+        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x19,0x04},2);  // Sample rate 200Hz
+        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x1A,0x03},2);  // DLPF 42Hz
         sw_write_bytes(MPU_ADDR,(uint8_t[]){0x1B,0x18},2);  // Gyro ±2000°/s
-        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x1C,0x01},2);  // Accel ±2G + filter
-                uint8_t id=0;
-        if(sw_read_bytes(MPU_ADDR,0x75,&id,1)){ESP_LOGI("MPU","WHO_AM_I=0x%02X",id);}
-        mpu_ok=true;ESP_LOGI("SENS","MPU6050 ready");return true;
+        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x1C,0x01},2);  // Accel ±2G
+        sw_write_bytes(MPU_ADDR,(uint8_t[]){0x6B,0},2);vTaskDelay(pdMS_TO_TICKS(50));
+        if(!CalibrateGyro()){
+            ESP_LOGE("MPU","gyro calibration failed");
+            mpu_ok=false; return false;
+        }
+        yaw_accum=0; mpu_last_read_us=0;
+        mpu_ok=true;
+        ESP_LOGI("SENS","MPU6050 ready bias=%.1f", gz_bias);
+        return true;
     }
     bool ReadMPU6050(float& roll,float& pitch,float& yaw){
+        I2cLock lock(i2c_mutex);
+        if(!lock.ok) return false;
         uint8_t r[14];  // Read all: accel(6)+temp(2)+gyro(6)
-        for(int retry=0;retry<3;retry++){
+        for(int retry=0;retry<2;retry++){
             if(sw_read_bytes(MPU_ADDR,0x3B,r,14)){
                 int16_t ax=(r[0]<<8)|r[1],ay=(r[2]<<8)|r[3],az=(r[4]<<8)|r[5];
                 int16_t gz=(r[12]<<8)|r[13];  // Gyro Z from 0x47-0x48
@@ -194,37 +242,46 @@ public:
                 pitch=atan2f(-accX,sqrtf(accY*accY+accZ*accZ))*57.2958f;
                 
                 // Gyro Z -> yaw integration
-                float yaw_rate = gz / 16.4f;  // +/-2000deg/s -> 16.4 LSB/deg/s
+                float yaw_rate = (gz - gz_bias) / 16.4f;  // +/-2000deg/s -> 16.4 LSB/deg/s
                 uint64_t now = esp_timer_get_time();
                 if(last_us == 0){ last_us = now; }
                 float dt = (now - last_us) / 1000000.0f;
                 last_us = now;
-                if(dt > 0.5f) dt = 0;  // Ignore large gaps
-                yaw_accum += yaw_rate * dt;
+                if(dt > 0.0f && dt < 1.0f) yaw_accum += yaw_rate * dt;  // Ignore large gaps
                 yaw = yaw_accum;
-                
+                mpu_last_read_us = now;
                 return true;
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
-        ESP_LOGE("MPU","read fail after 3 retries");
+        ESP_LOGE("MPU","read fail after retries");
         return false;
     }
 
     void InitAll(){
+        if(i2c_mutex == nullptr){ i2c_mutex = xSemaphoreCreateMutex(); }
         sw_init();vTaskDelay(pdMS_TO_TICKS(5));
         aht20_ok=InitAHT20();vl53_ok=InitVL53L0X();mpu_ok=InitMPU6050();
         ESP_LOGI("SENS","Sensors: AHT20=%d VL53=%d MPU=%d",aht20_ok,vl53_ok,mpu_ok);
     }
 
-    SensorData ReadAll(){
+    SensorData ReadSlowSensors(){
         SensorData d;
-        float t,h;uint16_t dis;float r,pi,y;
+        float t,h;uint16_t dis;
         if(ReadAHT20(t,h)){d.temp=t;d.hum=h;d.ok=true;}
         if(ReadVL53L0X(dis)){d.dist=dis;d.dist_ok=true;}
+        return d;
+    }
+
+    SensorData ReadAll(){
+        SensorData d=ReadSlowSensors();
+        float r,pi,y;
         if(ReadMPU6050(r,pi,y)){d.roll=r;d.pitch=pi;d.yaw=y;d.mpu_ok=true;}
         return d;
     }
 };
 float Sensors::yaw_accum=0;
 uint64_t Sensors::last_us=0;
+float Sensors::gz_bias=0;
+uint64_t Sensors::mpu_last_read_us=0;
+SemaphoreHandle_t Sensors::i2c_mutex = nullptr;

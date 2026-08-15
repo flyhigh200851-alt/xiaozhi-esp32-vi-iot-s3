@@ -62,7 +62,7 @@ public:
 
         mcp.AddTool("self.motor.turn_left",
             "Turn left (pivot). Call when user says: 左转, 向左转, 往左拐, turn left."
-            " I turn my body to the left.",
+            " I turn my body to the left. For a precise angle (90/180 degrees) use self.motor.turn_degrees.",
             PropertyList({
                 Property("speed", kPropertyTypeInteger, 50, 1, 100),
                 Property("duration", kPropertyTypeInteger, 2, 1, 30)
@@ -77,7 +77,7 @@ public:
 
         mcp.AddTool("self.motor.turn_right",
             "Turn right (pivot). Call when user says: 右转, 向右转, 往右拐, turn right."
-            " I turn my body to the right.",
+            " I turn my body to the right. For a precise angle (90/180 degrees) use self.motor.turn_degrees.",
             PropertyList({
                 Property("speed", kPropertyTypeInteger, 50, 1, 100),
                 Property("duration", kPropertyTypeInteger, 2, 1, 30)
