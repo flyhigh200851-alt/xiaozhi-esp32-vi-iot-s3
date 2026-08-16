@@ -206,17 +206,14 @@ Sensors g_sensors;
 SensorData g_sd;
 bool g_exploring = false;
 
-/* 结构化巡逻状态 */
+/* 螺旋巡逻状态 */
 static bool g_patrol_running = false;
 static bool g_patrol_stop = false;
-static float g_patrol_straight_yaw = 0;
-static uint32_t g_patrol_side_start_ms = 0;
-static int g_patrol_side_index = 0;
-static int g_patrol_loop_index = 0;
-static int g_patrol_side_ms = 1500;
-static int g_patrol_speed = 50;
 static int g_patrol_direction = 1;
 static int g_patrol_loops = 1;
+
+static void patrol_start(int side_cm, int loops, int direction, int speed, int mode);
+static void patrol_stop();
 
 /* ─── Babycare 直连警示：ALERT1 闪灯 -> 超时探索；ALERT0 全部停止 ─── */
 static bool g_alert_active = false;
@@ -243,12 +240,12 @@ static void alert_timeout_task(void* arg) {
     uint32_t epoch = (uint32_t)(uintptr_t)arg;
     vTaskDelay(pdMS_TO_TICKS(ALERT_TIMEOUT_SEC * 1000));
     if (g_alert_active && g_alert_epoch == epoch) {
-        ESP_LOGI(TAG, "Alert timeout: search mode");
-        g_exploring = true; g_cs.speed = 50; g_cs.dir = "找人"; motor_all(50, 50, 50, 50);
+        ESP_LOGI(TAG, "Alert timeout: patrol mode");
+        patrol_start(60, 9999, -1, 50, 0);
         vTaskDelay(pdMS_TO_TICKS(ALERT_PATROL_SEC * 1000));
         if (g_alert_active && g_alert_epoch == epoch) {
             ESP_LOGI(TAG, "Alert patrol cap: stop moving, LED keeps flashing");
-            g_exploring = false; motor_stop(); g_cs.speed = 0; g_cs.dir = "警示";
+            patrol_stop(); g_cs.dir = "警示";
         }
     }
     vTaskDelete(NULL);
@@ -257,8 +254,7 @@ static void alert_timeout_task(void* arg) {
 static void car_alert_stop() {
     g_alert_active = false;
     ++g_alert_epoch;
-    g_exploring = false;
-    motor_stop(); g_cs.speed = 0; g_cs.dir = "停止";
+    patrol_stop();
     auto* led = Board::GetInstance().GetLed();
     if (auto* sl = dynamic_cast<SingleLed*>(led)) sl->RestoreAutoLed();
     ESP_LOGI(TAG, "ALERT stop: LED off, motors stopped");
@@ -315,7 +311,7 @@ static void RunMotorTestTask(void* param) {
 static volatile bool g_gyro_turning = false;
 static void gyro_turn_task(void* arg);
 static void gyro_turn_start(int degrees);
-static void patrol_start(int side_cm, int loops, int direction, int speed);
+static void patrol_start(int side_cm, int loops, int direction, int speed, int mode);
 static void patrol_stop();
 
 /* ============ 红外发射 + 红外学习 ============ */
@@ -527,10 +523,11 @@ static esp_err_t car_cmd_handler(httpd_req_t* req) {
 }
 
 static esp_err_t car_status_handler(httpd_req_t* req) {
-    char buf[256];
+    char buf[512];
     snprintf(buf, sizeof(buf),
-        "{\"speed\":%d,\"temp\":%.1f,\"hum\":%.0f,\"dist\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f,\"mpu\":%d,\"uptime\":%lu}",
-        g_cs.speed, g_sd.temp, g_sd.hum, g_sd.dist, g_sd.roll, g_sd.pitch, g_sd.yaw, g_sd.mpu_ok ? 1 : 0,
+        "{\"speed\":%d,\"dir\":\"%s\",\"dist\":%d,\"radar\":%d,\"roll\":%.1f,\"pitch\":%.1f,\"yaw\":%.1f,\"mpu\":%d,\"temp\":%.1f,\"hum\":%.0f,\"mode\":\"%s\",\"model\":\"%s\",\"uptime\":%lu}",
+        g_cs.speed, g_cs.dir, g_sd.dist, g_cs.radar ? 1 : 0, g_sd.roll, g_sd.pitch, g_sd.yaw, g_sd.mpu_ok ? 1 : 0,
+        g_sd.temp, g_sd.hum, g_cs.mode, g_cs.model,
         (unsigned long)(esp_timer_get_time() / 1000000));
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
@@ -538,94 +535,73 @@ static esp_err_t car_status_handler(httpd_req_t* req) {
 
 static const char* kCarHtml = R"HTML(
 <!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>小智小车</title><style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:sans-serif}
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>小智小车 · 直连控制</title><style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,sans-serif;-webkit-tap-highlight-color:transparent}
 body{background:#0d1117;color:#e6edf3;padding:12px;padding-bottom:30px}
-h1{font-size:20px;margin-bottom:8px;color:#58a6ff}
-.st{display:grid;grid-template-columns:repeat(auto-fit,minmax(74px,1fr));gap:6px;margin-bottom:12px}
+.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+h1{font-size:20px;color:#58a6ff}
+.head .dot{width:10px;height:10px;border-radius:50%;background:#d29922;display:inline-block;margin-left:6px}
+.head .dot.on{background:#3fb950;box-shadow:0 0 8px #3fb950}
+.st{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
 .sc{background:#161b22;border-radius:8px;padding:8px;text-align:center}
-.sc .l{font-size:10px;color:#8b949e}.sc .v{font-size:18px;font-weight:700;color:#58a6ff}
-.dpad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:240px;margin:0 auto 12px}
-.dpad button{background:#21262d;border:none;color:#e6edf3;font-size:24px;padding:14px;border-radius:10px;cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none}
+.sc .l{font-size:9px;color:#8b949e}.sc .v{font-size:16px;font-weight:700;color:#58a6ff}
+.dpad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-width:240px;margin:0 auto 10px}
+.dpad button{background:#21262d;border:none;color:#e6edf3;font-size:22px;padding:12px;border-radius:10px;cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none;min-height:52px}
 .dpad button:active{background:#30363d}
-.dpad .s{background:#581010}
-.row{display:flex;gap:6px;margin-bottom:10px}
-.row button{flex:1;background:#21262d;border:none;color:#e6edf3;padding:10px;border-radius:8px;cursor:pointer;font-size:13px}
+.dpad .s{background:#581010;color:#fff}
+.row{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.row button{flex:1;min-width:70px;background:#21262d;border:none;color:#e6edf3;padding:9px 4px;border-radius:8px;cursor:pointer;font-size:12px}
 .row button:active{background:#30363d}
-.row button.g{background:#0e4429}.row button.r{background:#581010}
-.row button.a{background:#5a4a00}
-#wsd,#up{text-align:center;font-size:11px;color:#8b949e;margin-bottom:8px}
+.row .g{background:#0e4429}.row .r{background:#581010}.row .a{background:#5a4a00}
+#up{text-align:center;font-size:11px;color:#8b949e}
+@media(min-width:700px){body{max-width:520px;margin:0 auto}}
 </style></head><body>
-<h1>&#x1F697; 小智小车</h1>
-<div id="wsd">连接中...</div>
-<div id="up">运行 --</div>
+<div class="head"><h1>&#x1F697; 小智小车</h1><div><span id="up">--</span><span class="dot" id="dot"></span></div></div>
 <div class="st">
 <div class="sc"><div class="l">速度</div><div class="v" id="sp">0%</div></div>
+<div class="sc"><div class="l">方向</div><div class="v" id="di">停止</div></div>
+<div class="sc"><div class="l">前方</div><div class="v" id="ds">--</div></div>
+<div class="sc"><div class="l">人体</div><div class="v" id="rd">--</div></div>
+<div class="sc"><div class="l">航向</div><div class="v" id="yw">--</div></div>
+<div class="sc"><div class="l">陀螺仪</div><div class="v" id="mp">--</div></div>
 <div class="sc"><div class="l">温度</div><div class="v" id="tp">--</div></div>
 <div class="sc"><div class="l">湿度</div><div class="v" id="hm">--</div></div>
-<div class="sc"><div class="l">距离</div><div class="v" id="ds">--</div></div>
 </div>
 <div class="dpad">
-<div></div><button class="mv" data-cmd="self.motor.forward" data-args='{"speed":60,"duration":5}'>&#x2B06;</button><div></div>
-<button class="mv" data-cmd="self.motor.turn_left" data-args='{"speed":45,"duration":5}'>&#x2B05;</button><button class="s" onclick="c('self.motor.stop','{}')">&#x23F9;</button><button class="mv" data-cmd="self.motor.turn_right" data-args='{"speed":45,"duration":5}'>&#x27A1;</button>
-<div></div><button class="mv" data-cmd="self.motor.backward" data-args='{"speed":60,"duration":5}'>&#x2B07;</button><div></div>
+<div></div><button class="mv" data-cmd="F80">&#x2B06;</button><div></div>
+<button class="mv" data-cmd="L50">&#x2B05;</button><button class="s" data-cmd="S">&#x23F9;</button><button class="mv" data-cmd="R50">&#x27A1;</button>
+<div></div><button class="mv" data-cmd="B50">&#x2B07;</button><div></div>
 </div>
-<div class="row"><button class="g" onclick="c('self.motor.explore','{}')">探索</button><button class="r" onclick="c('self.motor.stop_explore','{}')">停止</button><button class="a" onclick="c('self.alert.stop','{}')">解除警示</button></div>
+<div class="row">
+<button data-cmd="SL30">&#x2B0C; 左移</button><button data-cmd="SR30">&#x2B0E; 右移</button>
+<button data-cmd="TL">&#x21B0; 左90</button><button data-cmd="TR">&#x21B1; 右90</button><button data-cmd="TU">&#x1F500; 掉头</button>
+</div>
+<div class="row">
+<button data-cmd="C40">&#x21BB; 转圈</button><button data-cmd="CC40">&#x21BA; 反转圈</button>
+</div>
+<div class="row">
+<button class="g" data-cmd="EXPLORE">&#x1F50D; 巡逻</button>
+<button class="g" data-cmd="CIRC10">&#x2B55; 圆形</button>
+<button class="g" data-cmd="CIRCR10">&#x2B6E; 反向</button>
+<button class="r" data-cmd="STOPEXP">&#x23F9; 停止巡逻</button>
+</div>
+<div class="row">
+<button class="a" data-cmd="ALERT1">&#x1F6A8; 警示</button>
+<button class="a" data-cmd="ALERT0">&#x2705; 解除</button>
+</div>
 <script>
-var ws=null,reT=null,holdTimer=null;
-var d=document.getElementById('wsd');
-function fmtUp(u){
- if(!u)return '运行 --';
- if(u<60)return '运行 '+u+'秒';
- return '运行 '+Math.floor(u/60)+'分'+(u%60)+'秒';
-}
-function connect(){
- clearTimeout(reT);
- ws=new WebSocket('ws://'+location.host+'/ws');
- ws.onopen=function(){d.textContent='已连接';};
- ws.onclose=function(){
-  d.textContent='已断开，自动重连中';
-  if(holdTimer){clearInterval(holdTimer);holdTimer=null;}
-  reT=setTimeout(connect,2000);
- };
- ws.onerror=function(){try{ws.close();}catch(e){}};
-}
-connect();
-var seq=1;
-function c(name,args){
- if(ws.readyState!==1)return;
- ws.send(JSON.stringify({type:'mcp',payload:{jsonrpc:'2.0',id:seq++,method:'tools/call',params:{name:name,arguments:JSON.parse(args||'{}')}}}));
-}
-function startMove(b){
- if(!b.dataset.cmd)return;
- stopMove();
- var go=function(){c(b.dataset.cmd,b.dataset.args||'{}');};
- go();
- holdTimer=setInterval(go,2000);
-}
-function stopMove(){
- if(holdTimer){clearInterval(holdTimer);holdTimer=null;}
- c('self.motor.stop','{}');
-}
+function cmd(c){fetch('/api/command?c='+encodeURIComponent(c)).catch(function(){});}
+var holdTimer=null;
+function startMove(b){var c=b.dataset.cmd;if(!c)return;stopMove();var go=function(){cmd(c);};go();holdTimer=setInterval(go,1800);}
+function stopMove(){if(holdTimer){clearInterval(holdTimer);holdTimer=null;}cmd('S');}
 var mv=document.querySelectorAll('.dpad .mv');
-for(var i=0;i<mv.length;i++){
- (function(b){
-  b.addEventListener('pointerdown',function(e){e.preventDefault();startMove(b);});
-  ['pointerup','pointercancel','pointerleave'].forEach(function(ev){
-   b.addEventListener(ev,function(e){e.preventDefault();stopMove();});
-  });
- })(mv[i]);
-}
-setInterval(function(){
- fetch('/api/status').then(function(r){return r.json()}).then(function(s){
-  document.getElementById('sp').textContent=(s.speed||0)+'%';
-  document.getElementById('tp').textContent=s.temp?s.temp.toFixed(1)+'C':'--';
-  document.getElementById('hm').textContent=s.hum?s.hum.toFixed(0)+'%':'--';
-  document.getElementById('ds').textContent=(s.dist&&s.dist<2000?s.dist+'mm':'--');
-  document.getElementById('up').textContent=fmtUp(s.uptime);
- }).catch(function(){});
-},2000);
+for(var i=0;i<mv.length;i++){(function(b){b.addEventListener('pointerdown',function(e){e.preventDefault();startMove(b);});['pointerup','pointercancel','pointerleave'].forEach(function(ev){b.addEventListener(ev,function(e){e.preventDefault();stopMove();});});})(mv[i]);}
+document.querySelectorAll('[data-cmd]').forEach(function(b){if(b.classList.contains('mv'))return;b.addEventListener('click',function(){cmd(b.dataset.cmd);});});
+function fmtUp(u){if(!u)return '--';if(u<60)return u+'s';return Math.floor(u/60)+'m'+(u%60)+'s';}
+function poll(){fetch('/api/status').then(function(r){return r.json()}).then(function(s){document.getElementById('sp').textContent=(s.speed||0)+'%';document.getElementById('di').textContent=s.dir||'--';document.getElementById('ds').textContent=(s.dist>0?Math.round(s.dist/10)+'cm':'--');document.getElementById('rd').textContent=s.radar?'✓':'--';document.getElementById('yw').textContent=(typeof s.yaw==='number'?s.yaw.toFixed(0)+'°':'--');document.getElementById('mp').textContent=s.mpu?'正常':'异常';document.getElementById('tp').textContent=s.temp?s.temp.toFixed(1)+'C':'--';document.getElementById('hm').textContent=s.hum?s.hum.toFixed(0)+'%':'--';document.getElementById('up').textContent=fmtUp(s.uptime);document.getElementById('dot').classList.add('on');}).catch(function(){document.getElementById('dot').classList.remove('on');});}
+setInterval(poll,1000);poll();
+document.addEventListener('keydown',function(e){var k=e.key.toLowerCase();if(k==='w'||k==='arrowup'){cmd('F80');}else if(k==='s'||k==='arrowdown'){cmd('B50');}else if(k==='a'||k==='arrowleft'){cmd('L50');}else if(k==='d'||k==='arrowright'){cmd('R50');}else if(k==='q'){cmd('C40');}else if(k==='e'){cmd('CC40');}else if(k===' '){e.preventDefault();cmd('S');}});
 </script></body></html>
 )HTML";
 
@@ -671,7 +647,7 @@ void web_cmd_callback(const char* cmd, int val) {
     else if (!strcmp(cmd,"SR")){ motor_all(val,-val,-val,val); g_cs.dir="右横移"; }
     else if (!strcmp(cmd,"C")){ motor_all(val,-val,val,-val); g_cs.dir="旋转"; }
     else if (!strcmp(cmd,"CC")){ motor_all(-val,val,-val,val); g_cs.dir="旋转"; }
-    else if (!strcmp(cmd,"S")){ motor_stop(); g_cs.dir="停止"; g_cs.speed=0; }
+    else if (!strcmp(cmd,"S")){ patrol_stop(); }
     else if (!strcmp(cmd,"TL")){ gyro_turn_start(-90); g_cs.dir="左转90°"; }
     else if (!strcmp(cmd,"TR")){ gyro_turn_start(90); g_cs.dir="右转90°"; }
     else if (!strcmp(cmd,"TU")){ gyro_turn_start(180); g_cs.dir="掉头"; }
@@ -766,7 +742,7 @@ void web_cmd_callback(const char* cmd, int val) {
         }
     }
     else if (!strcmp(cmd,"EXPLORE")){
-        patrol_start(60, 9999, 1, 50);
+        patrol_start(0, 9999, -1, 50, 0);
     }
     else if (!strcmp(cmd,"STOPEXP")){
         patrol_stop();
@@ -792,10 +768,15 @@ void web_cmd_callback(const char* cmd, int val) {
             esp_restart();
         }
     }
-    else if (!strcmp(cmd,"RECT")){
-        if (val <= 0) val = 60;
-        patrol_start(val, 1, 1, 50);
-        ESP_LOGI(TAG, "RECT start side=%dcm", val);
+    else if (!strcmp(cmd,"CIRC")){
+        if (val <= 0) val = 10;
+        patrol_start(0, val, -1, 50, 0);
+        ESP_LOGI(TAG, "CIRC start circles=%d", val);
+    }
+    else if (!strcmp(cmd,"CIRCR")){
+        if (val <= 0) val = 10;
+        patrol_start(0, val, 1, 50, 0);
+        ESP_LOGI(TAG, "CIRCR reverse circles=%d", val);
     }
     else if (!strcmp(cmd,"T")){ motor_test(); }
 }
@@ -998,7 +979,7 @@ public:
             [](int s) { g_cs.speed=s; motor_notify("左横移", -s, s, s, -s); },
             [](int s) { g_cs.speed=s; motor_notify("右横移", s, -s, -s, s); },
             [](int s) { g_cs.speed=s; motor_notify("旋转",  s, -s,  s, -s); },
-            []()      { g_cs.dir="停止";g_cs.speed=0; motor_stop(); },
+            []()      { patrol_stop(); },
             []()      { motor_test(); }
         );
         InitializeButtons();
@@ -1016,11 +997,11 @@ public:
         {
             auto& mcp = McpServer::GetInstance();
             mcp.AddTool("self.motor.explore",
-                "Start structured rectangle patrol: drive a rectangle loop, keep straight with the gyroscope, and scan left/right with gyro turns when hitting an obstacle. "
+                "Start spiral circle patrol: spin in place first, then circles expand outward to about 50cm radius and shrink back to center. "
                 "Stop with self.motor.stop_explore.",
                 PropertyList(),
                 [](const PropertyList&) -> ReturnValue {
-                    patrol_start(60, 9999, 1, 50); return true;
+                    patrol_start(0, 9999, -1, 50, 0); return true;
                 });
             mcp.AddTool("self.motor.stop_explore",
                 "Stop exploration mode and stop the car.",
@@ -1041,22 +1022,28 @@ public:
                     gyro_turn_start(dir > 0 ? deg : -deg);
                     return true;
                 });
-            mcp.AddTool("self.motor.drive_rectangle",
-                "Drive around a rectangle loop instead of spinning in place. Use when the user asks 转圈, 绕圈, 绕着转, 按矩形转圈, or drive a 60cm circle. "
-                "Each loop drives 4 straight sides with gyro 90-degree corner turns, keeps straight with the gyroscope, and avoids obstacles. "
-                "side_cm is one side length, default 60cm.",
+            mcp.AddTool("self.motor.drive_circle",
+                "Drive spiral circle patrol. Use when the user asks 转圈, 绕圈, 圆圈巡逻, 圆形巡逻. "
+                "Starts spinning in place, expands outward to about 50cm radius, then shrinks back to center.",
                 PropertyList({
-                    Property("side_cm", kPropertyTypeInteger, 60, 20, 500),
-                    Property("loops", kPropertyTypeInteger, 1, 1, 10),
-                    Property("direction", kPropertyTypeInteger, 1, -1, 1),
-                    Property("speed", kPropertyTypeInteger, 50, 20, 80),
+                    Property("circles", kPropertyTypeInteger, 10, 1, 100),
+                    Property("direction", kPropertyTypeInteger, -1, -1, 1),
                 }),
                 [](const PropertyList& props) -> ReturnValue {
-                    int side = props["side_cm"].value<int>();
-                    int loops = props["loops"].value<int>();
+                    int circles = props["circles"].value<int>();
                     int dir = props["direction"].value<int>();
-                    int speed = props["speed"].value<int>();
-                    patrol_start(side, loops, dir, speed);
+                    patrol_start(0, circles, dir, 50, 0);
+                    return true;
+                });
+            mcp.AddTool("self.motor.patrol_reverse",
+                "Reverse circle patrol. Use when the user asks 倒转巡逻, 反向巡逻, 倒着转圈. "
+                "Same spiral circle patrol but rotates the opposite direction.",
+                PropertyList({
+                    Property("circles", kPropertyTypeInteger, 10, 1, 100),
+                }),
+                [](const PropertyList& props) -> ReturnValue {
+                    int circles = props["circles"].value<int>();
+                    patrol_start(0, circles, 1, 50, 0);
                     return true;
                 });
             mcp.AddTool("self.ir.send",
@@ -1174,10 +1161,6 @@ public:
                     g_sd.dist = slow.dist; g_sd.dist_ok = slow.dist_ok;
                     g_cs.dist = slow.dist_ok ? slow.dist : -1;
                 }
-                if(!g_exploring && g_cs.speed > 0 && g_sd.dist_ok){
-                    uint16_t d = g_sd.dist;
-                    if(d > 0 && d < 200){ motor_stop(); g_cs.speed = 0; ESP_LOGI(TAG, "AUTO-STOP %dmm", d); }
-                }
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
         }, "sensor_read", 8192, NULL, 4, NULL);
@@ -1278,134 +1261,105 @@ static void gyro_turn_start(int degrees) {
     xTaskCreate(gyro_turn_task, "gyro_turn", 4096, (void*)(intptr_t)degrees, 5, NULL);
 }
 
-/* 结构化巡逻：矩形路径 + 陀螺仪直线纠偏 + 左右扫描避障 */
-#define RECT_SPEED_CM_PER_SEC 40.0f
+/* 螺旋巡逻：原地转圈 -> 逐渐扩大 -> 最大半径 -> 再缩小回来 */
+#define PATROL_PAUSE_MS 10000
 
-static bool wait_gyro_done(uint32_t timeout_ms) {
-    uint32_t start = esp_timer_get_time() / 1000;
-    while (g_gyro_turning && !g_patrol_stop && (esp_timer_get_time() / 1000 - start) < timeout_ms) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    return !g_gyro_turning;
-}
-
-static int read_vl53_mm() {
-    uint16_t d = 0;
-    return g_sensors.ReadVL53L0X(d) ? (int)d : -1;
-}
-
-static void patrol_forward_start() {
-    g_patrol_straight_yaw = Sensors::yaw_accum;
-    g_patrol_side_start_ms = esp_timer_get_time() / 1000;
-    g_cs.dir = "巡逻直行";
-    g_cs.speed = g_patrol_speed;
-    motor_all(g_patrol_speed, g_patrol_speed, g_patrol_speed, g_patrol_speed);
-}
-
-static void patrol_apply_straight_correction() {
-    if (g_cs.speed <= 0 || !g_sd.mpu_ok) return;
-    float drift = Sensors::yaw_accum - g_patrol_straight_yaw;
-    if (drift > 180.0f) drift -= 360.0f;
-    if (drift < -180.0f) drift += 360.0f;
-    int corr = (int)(drift * 0.8f);
-    if (corr > 12) corr = 12;
-    if (corr < -12) corr = -12;
-    if (corr == 0) return;
-    /* 实机观测：顺时针 yaw 为负，偏右时左轮降速、右轮提速 */
-    int left = g_patrol_speed + corr;
-    int right = g_patrol_speed - corr;
-    motor_all(left, right, left, right);
-}
-
-static void patrol_avoid_obstacle() {
+static bool patrol_pause_for_command() {
     motor_stop();
     g_cs.speed = 0;
-    g_cs.dir = "避障扫描";
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    gyro_turn_start(90);
-    wait_gyro_done(15000);
-    if (g_patrol_stop) return;
-    int right = read_vl53_mm();
-
-    gyro_turn_start(-180);
-    wait_gyro_done(15000);
-    if (g_patrol_stop) return;
-    int left = read_vl53_mm();
-
-    gyro_turn_start(90);
-    wait_gyro_done(15000);
-    if (g_patrol_stop) return;
-
-    int turn = 90;
-    if (left > right) turn = -90;
-    if (left < 0 && right < 0) turn = (rand() % 2) ? 90 : -90;
-    ESP_LOGI(TAG, "AVOID left=%d right=%d turn=%d", left, right, turn);
-
-    g_cs.dir = "避障转弯";
-    gyro_turn_start(turn);
-    wait_gyro_done(15000);
-    if (g_patrol_stop) return;
-
-    g_cs.dir = "避障绕行";
-    g_cs.speed = 40;
-    motor_all(40, 40, 40, 40);
-    uint32_t detour_start = esp_timer_get_time() / 1000;
-    while (!g_patrol_stop && (esp_timer_get_time() / 1000 - detour_start) < 700) {
-        uint16_t d = 0;
-        bool ok = g_sensors.ReadVL53L0X(d);
-        if (ok && d > 0 && d < 350) break;
-        vTaskDelay(pdMS_TO_TICKS(30));
+    g_cs.dir = "巡逻暂停听指令";
+    auto& app = Application::GetInstance();
+    if (app.GetDeviceState() == kDeviceStateSpeaking) {
+        app.AbortSpeaking(kAbortReasonNone);
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
-    motor_stop();
-    g_cs.speed = 0;
+    if (app.GetDeviceState() == kDeviceStateListening) {
+        app.StopListening();
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    app.StartListening();
+    uint32_t t0 = esp_timer_get_time() / 1000;
+    while (!g_patrol_stop && (esp_timer_get_time() / 1000 - t0) < PATROL_PAUSE_MS) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    app.StopListening();
+    return !g_patrol_stop;
+}
 
-    gyro_turn_start(-turn);
-    wait_gyro_done(15000);
+static void patrol_spiral_loop() {
+    const int delta = 30;
+    const int expand_base[] = {0, 10, 20, 30, 40, 50, 60, 70};
+    const int back_base[] = {60, 50, 40, 30, 20, 10, 0};
+    const int expand_stages = (int)(sizeof(expand_base) / sizeof(expand_base[0]));
+    const int back_stages = (int)(sizeof(back_base) / sizeof(back_base[0]));
+    const int max_stage = expand_stages - 1;
+    const int max_stage_loops = 3;  /* 最大圈多转 2 圈 */
+    bool expanding = true;
+    int stage = 0;
+    int circle = 0;
+    int cycle_count = 0;
+    int max_loops_done = 0;
+    while (g_patrol_running && !g_patrol_stop && circle < g_patrol_loops) {
+        int base = expanding ? expand_base[stage] : back_base[stage];
+        int left = base + delta;
+        int right = base - delta;
+        if (g_patrol_direction < 0) { int t = left; left = right; right = t; }
+        if (left > 100) left = 100;
+        if (right < -100) right = -100;
+        if (left < -100) left = -100;
+        if (right > 100) right = 100;
+
+        g_cs.dir = (base == 0) ? "原地转圈" : (expanding ? "圆形巡逻" : "返回中心");
+        g_cs.speed = (abs(left) > abs(right) ? abs(left) : abs(right));
+        motor_all(left, right, left, right);
+
+        float start = Sensors::yaw_accum;
+        uint32_t t0 = esp_timer_get_time() / 1000;
+        while (g_patrol_running && !g_patrol_stop) {
+            if (fabsf(Sensors::yaw_accum - start) >= 360.0f) break;
+            if (esp_timer_get_time() / 1000 - t0 > 45000) {
+                ESP_LOGW(TAG, "Circle timeout stage=%d", stage);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        motor_stop();
+        g_cs.speed = 0;
+
+        circle++;
+        ESP_LOGI(TAG, "Circle %d done stage=%d base=%d", circle, stage, base);
+
+        if (expanding) {
+            if (stage >= max_stage) {
+                max_loops_done++;
+                if (max_loops_done >= max_stage_loops) {
+                    expanding = false;
+                    stage = back_stages - 1;
+                    max_loops_done = 0;
+                }
+            } else {
+                stage++;
+            }
+        } else {
+            if (stage <= 0) {
+                expanding = true; stage = 0; max_loops_done = 0;
+                cycle_count++;
+                ESP_LOGI(TAG, "Spiral cycle %d done", cycle_count);
+                if (cycle_count % 2 == 0) {
+                    if (!patrol_pause_for_command()) break;
+                }
+            } else {
+                stage--;
+            }
+        }
+    }
 }
 
 static void patrol_task(void* arg) {
     g_patrol_stop = false;
     g_patrol_running = true;
-    g_patrol_side_index = 0;
-    g_patrol_loop_index = 0;
-    ESP_LOGI(TAG, "Patrol start side=%dms loops=%d speed=%d", g_patrol_side_ms, g_patrol_loops, g_patrol_speed);
-
-    while (g_patrol_running && !g_patrol_stop && g_patrol_loop_index < g_patrol_loops) {
-        patrol_forward_start();
-        bool side_done = false;
-        while (g_patrol_running && !g_patrol_stop && !side_done) {
-            patrol_apply_straight_correction();
-
-            uint16_t d = 0;
-            bool ok = g_sensors.ReadVL53L0X(d);
-            uint32_t now = esp_timer_get_time() / 1000;
-            if (ok && d > 0 && d < 350) {
-                ESP_LOGI(TAG, "Patrol obstacle %dmm", d);
-                patrol_avoid_obstacle();
-                g_patrol_side_start_ms = esp_timer_get_time() / 1000;
-                side_done = true;
-                break;
-            }
-            if (now - g_patrol_side_start_ms >= (uint32_t)g_patrol_side_ms) {
-                motor_stop();
-                g_cs.speed = 0;
-                g_cs.dir = "巡逻转弯";
-                gyro_turn_start(g_patrol_direction > 0 ? 90 : -90);
-                wait_gyro_done(15000);
-                g_patrol_side_index++;
-                if (g_patrol_side_index >= 4) {
-                    g_patrol_side_index = 0;
-                    g_patrol_loop_index++;
-                    ESP_LOGI(TAG, "Patrol loop %d done", g_patrol_loop_index);
-                }
-                side_done = true;
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(30));
-        }
-    }
-
+    ESP_LOGI(TAG, "Spiral patrol start circles=%d direction=%d", g_patrol_loops, g_patrol_direction);
+    patrol_spiral_loop();
     motor_stop();
     g_cs.speed = 0;
     g_cs.dir = "停止";
@@ -1415,14 +1369,12 @@ static void patrol_task(void* arg) {
     vTaskDelete(NULL);
 }
 
-static void patrol_start(int side_cm, int loops, int direction, int speed) {
-    if (side_cm < 20) side_cm = 20;
-    if (side_cm > 500) side_cm = 500;
+static void patrol_start(int side_cm, int loops, int direction, int speed, int mode) {
+    (void)side_cm;
+    (void)speed;
+    (void)mode;
     if (loops < 1) loops = 1;
     if (loops > 10000) loops = 10000;
-    if (speed < 20) speed = 20;
-    if (speed > 80) speed = 80;
-
     if (g_patrol_running) {
         g_patrol_stop = true;
         uint32_t wait = esp_timer_get_time() / 1000;
@@ -1430,13 +1382,10 @@ static void patrol_start(int side_cm, int loops, int direction, int speed) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
-
-    g_patrol_side_ms = (int)(side_cm / RECT_SPEED_CM_PER_SEC * 1000.0f);
-    g_patrol_speed = speed;
     g_patrol_direction = direction;
     g_patrol_loops = loops;
     g_exploring = true;
-    xTaskCreate(patrol_task, "patrol", 8192, NULL, 5, NULL);
+    xTaskCreate(patrol_task, "patrol", 4096, NULL, 5, NULL);
 }
 
 static void patrol_stop() {

@@ -183,7 +183,7 @@ public:
             uint16_t d=((uint16_t)gb[10]<<8)|gb[11];
             sw_write_bytes(VL53_ADDR,(uint8_t[]){0x15,1},2); // clear interrupt
             ESP_LOGI("VL53","dist=%dmm raw=%02x%02x",d,gb[10],gb[11]);
-            if(d>0&&d<2000){dist=d;return true;}
+            if(d>=30&&d<2000){dist=d;return true;}
         }
         return false;
     }
