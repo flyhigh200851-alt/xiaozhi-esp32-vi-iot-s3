@@ -215,11 +215,9 @@ static int g_patrol_loops = 1;
 static void patrol_start(int side_cm, int loops, int direction, int speed, int mode);
 static void patrol_stop();
 
-/* ─── Babycare 直连警示：ALERT1 闪灯 -> 超时探索；ALERT0 全部停止 ─── */
+/* ─── Babycare 直连警示：ALERT1 只闪灯；ALERT0 全部停止 ─── */
 static bool g_alert_active = false;
 static uint32_t g_alert_epoch = 0;
-#define ALERT_TIMEOUT_SEC 60
-#define ALERT_PATROL_SEC 300
 
 static void alert_flash_task(void* arg) {
     uint32_t epoch = (uint32_t)(uintptr_t)arg;
@@ -233,21 +231,6 @@ static void alert_flash_task(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(350));
     }
     if (sl) sl->RestoreAutoLed();
-    vTaskDelete(NULL);
-}
-
-static void alert_timeout_task(void* arg) {
-    uint32_t epoch = (uint32_t)(uintptr_t)arg;
-    vTaskDelay(pdMS_TO_TICKS(ALERT_TIMEOUT_SEC * 1000));
-    if (g_alert_active && g_alert_epoch == epoch) {
-        ESP_LOGI(TAG, "Alert timeout: patrol mode");
-        patrol_start(60, 9999, -1, 50, 0);
-        vTaskDelay(pdMS_TO_TICKS(ALERT_PATROL_SEC * 1000));
-        if (g_alert_active && g_alert_epoch == epoch) {
-            ESP_LOGI(TAG, "Alert patrol cap: stop moving, LED keeps flashing");
-            patrol_stop(); g_cs.dir = "警示";
-        }
-    }
     vTaskDelete(NULL);
 }
 
@@ -266,8 +249,7 @@ static void car_alert_start() {
     g_alert_active = true;
     g_cs.speed = 0; g_cs.dir = "警示";
     xTaskCreate(alert_flash_task, "alert_flash", 3072, (void*)(uintptr_t)epoch, 3, NULL);
-    xTaskCreate(alert_timeout_task, "alert_to", 3072, (void*)(uintptr_t)epoch, 3, NULL);
-    ESP_LOGI(TAG, "ALERT start: LED flashing, timeout=%ds", ALERT_TIMEOUT_SEC);
+    ESP_LOGI(TAG, "ALERT start: LED flashing only");
 }
 
 static void motor_notify(const char* status, int fl, int fr, int rl, int rr) {
